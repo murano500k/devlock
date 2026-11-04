@@ -10,7 +10,9 @@ another's test. devlock is a set of Claude Code hooks plus a small queueing CLI:
   (`adb -s <serial>`, `ANDROID_SERIAL=<serial>`, `fastboot -s`, `scrcpy -s`); unnamed calls and
   `adb -d/-e/-t` are refused, because devlock cannot tell which device they reach.
 - The first command on a device gives the session a short **lease** (5 min, or the Bash timeout + 1
-  min). Other sessions are refused while it is held. The lease drops when the session's turn ends.
+  min). Other sessions are refused while it is held. When the session's turn ends the lease shrinks
+  to 2 minutes, or is dropped at once if another session is waiting for the device.
+- `devlock hold <device> --ttl 30m` keeps a device for a session across turns.
 - Long or background work goes through `devlock run <device>[,<device>] -- <command>`, which queues
   until the devices are free and holds them until the command's whole process group exits.
 - `adb kill-server` / `adb disconnect` (all devices) are refused while another session uses any
@@ -50,6 +52,7 @@ script my-ota-tool/run\.py\s+(push|install)
 ```
 devlock run [--timeout SEC] DEVICE[,DEVICE...] -- COMMAND...
 devlock wait [--timeout SEC] DEVICE[,DEVICE...]
+devlock hold [--ttl 30m] [--note TEXT] DEVICE[,DEVICE...]
 devlock status
 devlock release [DEVICE]
 ```

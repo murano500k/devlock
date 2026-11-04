@@ -25,8 +25,9 @@ devlock is a set of Claude Code hooks plus a small CLI.
    refused, because devlock cannot tell which device it would reach.
 3. **The first command on a device gives the session a lease.** While the lease is held, other
    sessions' commands on that device are refused with the holder's details.
-4. **The lease ends with the turn.** When Claude finishes answering, the session's leases are
-   dropped, so the next session can start at once.
+4. **The lease ends soon after the turn.** When Claude finishes answering, the session's leases
+   shrink to 2 minutes, so your next prompt still finds the device. If another session is already
+   waiting for the device, they are dropped at once.
 5. **Long work goes through `devlock run`.** It waits in line for the devices, then holds them
    until the command and everything it started have exited.
 
@@ -90,7 +91,25 @@ ANDROID_SERIAL=R58M12345AB ./gradlew connectedDebugAndroidTest
 ```
 
 The first command gives the session a lease for 5 minutes, or for the Bash timeout plus one
-minute when that is longer. Every later command renews it. The lease is dropped when the turn ends.
+minute when that is longer. Every later command renews it. When the turn ends, the lease shrinks to
+2 minutes (`DEVLOCK_STICKY_SEC`), or is dropped at once if a `devlock run` or `devlock wait` of
+another session is waiting for the device. Closing the session drops it at once.
+
+### Keeping a device between turns
+
+To keep a device while you read results, debug by hand, or think about the next step, hold it:
+
+```bash
+devlock hold --ttl 1h --note "HDMI-CEC debugging" tv1
+devlock release tv1
+```
+
+- Default TTL is 30 minutes, the maximum 8 hours. Running `hold` again extends it.
+- Other sessions are refused and their runs wait, with your note in the message.
+- A hold taken by Claude ends when that Claude session ends. A hold taken in a terminal ends only at
+  its TTL or on `devlock release`, run from the same shell.
+- `hold` does not wait. If the device is busy it is refused; `devlock wait <device>` first.
+- Agents are told to take a hold only when you ask for one.
 
 ### Long or background work
 
@@ -130,11 +149,14 @@ devlock run R58M12345AB -- 'adb -s R58M12345AB reboot bootloader && fastboot -s 
 ```
 $ devlock status
 R58M12345AB  run: session=4f1c... pid=81234 since=14:02:11 cmd=./run-ota-test.sh
+R58M12345AB  waiting #1: session=b210... pid=81502 since=14:05:40 cmd=./perf.sh
 192.168.0.60:5555  lease: session=9a7e... until 14:09:40  (this session)
+R58N67890CD  hold: session=shell-4410 until 15:30:00 note='HDMI-CEC debugging'
 (this session: 9a7e...)
 ```
 
-`devlock release [DEVICE]` drops your session's leases early. Runs end when their command does.
+`devlock release [DEVICE]` drops your session's leases and holds early. Runs end when their command
+does.
 
 ## What a refusal looks like
 
@@ -168,7 +190,8 @@ device (`adb -s`, `ANDROID_SERIAL`, `fastboot -s`); run long or background devic
 | Every device command is refused with "Name the device" | The command lets adb choose. Add `-s <serial>` or `ANDROID_SERIAL=<serial>`. |
 | "devlock needs the device spelled out, not a variable" | `adb -s $DEV` cannot be checked before it runs. Write the serial out, or wrap the work in `devlock run <dev> -- ...` and use `$ANDROID_SERIAL` inside it. |
 | The same TV is locked twice under two names | Its names are not on one line in `devices.conf`. Add the missing address. |
-| A device stays busy after a session crashed | A lease ends on its own within 5 minutes (or the Bash timeout plus one minute). A run ends when its processes are gone. `devlock status` shows the holder. Do not delete state files while a session may still be using the device. |
+| A device stays busy after a session crashed | A lease ends on its own within 5 minutes (or the Bash timeout plus one minute). A run ends when its processes are gone. A hold ends at its TTL. `devlock status` shows the holder. Do not delete state files while a session may still be using the device. |
+| A device stays busy for 2 minutes after the other session finished | That is the sticky window, kept for the other session's next prompt. Queue with `devlock run`: a waiting run ends the window at once. |
 | "devlock state is locked by a stuck process" | Another devlock process held the state lock for over 5 seconds. Retry. If it repeats, look for a hung `devlock` process. |
 | Hooks seem to do nothing | Restart the session. Check that `~/.claude/settings.json` has `devlock hook pre` under `PreToolUse`, and read `~/.local/state/devlock/hook.log`. |
 | A command was wrongly refused or wrongly allowed | `hook.log` records every decision with the full command. Please open an issue with the line. |

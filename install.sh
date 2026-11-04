@@ -51,7 +51,7 @@ new=$(jq --arg c '$HOME/.claude/skills/devlock/devlock hook' '
 	| add("PostToolUse"; "Bash"; "post")
 	| add("PostToolUseFailure"; "Bash"; "post")
 	| add("Stop"; null; "stop")
-	| add("SessionEnd"; null; "stop")' "$SETTINGS")
+	| add("SessionEnd"; null; "end")' "$SETTINGS")
 if [ "$new" = "$(jq . "$SETTINGS")" ]; then
 	echo "hooks already registered in $SETTINGS"
 	exit 0

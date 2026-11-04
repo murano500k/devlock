@@ -38,17 +38,33 @@ Exit status:
 Blocks until no other session holds any of the devices, then exits 0. It does not take the
 devices. Default timeout is 0 (forever). Exit 75 on timeout.
 
+While it waits, `run` and `wait` leave a ticket in `<device>.queue`. A ticket tells the holder's
+end of turn to drop its lease at once instead of keeping the sticky window.
+
+### `devlock hold [--ttl DURATION] [--note TEXT] DEVICE[,DEVICE...]`
+
+Keeps the devices for the calling session until the TTL ends.
+
+- `--ttl`: a number with an optional unit `s`, `m` or `h`. Default 30m, maximum
+  `DEVLOCK_HOLD_MAX` (8h).
+- `--note`: shown to other sessions in refusals and in `status`.
+- Running it again on a held device replaces the hold, so it extends it.
+- Exits 1, without waiting, when another session has any of the devices.
+- A hold taken with `CLAUDE_CODE_SESSION_ID` set ends at that session's SessionEnd. A hold taken
+  without it (a terminal) ends only at its TTL or on `release` from the same shell.
+
 ### `devlock status`
 
-Lists every live run and lease, one line each, and marks those of the calling session. Prints
-`all devices free` when there are none, then the calling session's id.
+Lists every live run, hold, lease and waiting job, one line each, and marks those of the calling
+session. A lease kept after its session's turn ended is marked `(idle after its turn)`. Prints
+`all devices free` when there is nothing, then the calling session's id.
 
 ### `devlock release [DEVICE]`
 
-Drops the calling session's leases: on one device, or on all of them without `DEVICE`. Runs are
-not affected; they end when their command does.
+Drops the calling session's leases and holds: on one device, or on all of them without `DEVICE`.
+Runs are not affected; they end when their command does.
 
-### `devlock hook pre|post|stop`
+### `devlock hook pre|post|stop|end`
 
 Entry points for Claude Code. They read the hook's JSON from stdin. Not meant to be run by hand.
 
@@ -68,8 +84,11 @@ A device is busy for session S when another session has either of these:
   - Lasts `DEVLOCK_LEASE_SEC` (default 300) or the Bash call's timeout plus 60 s, whichever is
     longer (Bash default timeout 120 s).
   - `post` extends it to at least `now + DEVLOCK_LEASE_SEC` after each command.
-  - `stop` (end of turn, end of session) drops it, unless one of the session's commands is still
-    running, for example in a background subagent.
+  - `stop` (end of turn) shortens it to at most `DEVLOCK_STICKY_SEC` (120 s) from now and marks
+    it idle. It drops it at once when another session has a `run` or `wait` waiting for the device.
+    A lease with a command still running (for example in a background subagent) is left as it is.
+  - `end` (end of session) drops it at once.
+- **Hold** - taken by `devlock hold`. Lasts until its TTL.
 - **Run** - registered by `devlock run`. Alive while the `devlock run` process (matched by pid and
   start time) or any process in its command's process group is alive.
 
@@ -165,6 +184,8 @@ Location: `$DEVLOCK_CONF`, default `$DEVLOCK_DIR/devices.conf` (`install.sh --co
 | `DEVLOCK_DIR` | `~/.local/state/devlock` | state, log, default config location |
 | `DEVLOCK_CONF` | `$DEVLOCK_DIR/devices.conf` | device list |
 | `DEVLOCK_LEASE_SEC` | `300` | lease length after each command |
+| `DEVLOCK_STICKY_SEC` | `120` | how long a lease outlives its turn; `0` drops it at the end of the turn |
+| `DEVLOCK_HOLD_MAX` | `28800` | longest `devlock hold --ttl`, in seconds |
 | `CLAUDE_CODE_SESSION_ID` | set by Claude Code | session identity |
 | `DEVLOCK_HELD` | set by `devlock run` | devices the run holds |
 | `ANDROID_SERIAL` | set by `devlock run` (one device) | device for adb, Gradle and scrcpy |
@@ -177,7 +198,7 @@ Location: `$DEVLOCK_CONF`, default `$DEVLOCK_DIR/devices.conf` (`install.sh --co
 | `PostToolUse` | `Bash` | `devlock hook post` |
 | `PostToolUseFailure` | `Bash` | `devlock hook post` |
 | `Stop` | all | `devlock hook stop` |
-| `SessionEnd` | all | `devlock hook stop` |
+| `SessionEnd` | all | `devlock hook end` |
 
 Each has a 10 s timeout. Re-running `install.sh` replaces older devlock entries and leaves other
 hooks alone.
@@ -190,6 +211,8 @@ All in `$DEVLOCK_DIR`:
 |---|---|
 | `<device>.lease` | the current lease: `{"session", "until", "inflight": {tool_use_id: deadline}}`, or `null` |
 | `<device>.runs` | list of runs: session, pid, process start time, process group, start time, command |
+| `<device>.hold` | the current hold: `{"session", "kind": "claude"\|"shell", "until", "note", "since"}`, or `null` |
+| `<device>.queue` | waiting `run`/`wait` processes, same fields as a run without the process group |
 | `.mutex` | lock file for every state change |
 | `hook.log`, `hook.log.1` | every allow, deny and error, with the command; rotated at 1 MB |
 | `devices.conf` | link to your device list |

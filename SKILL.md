@@ -13,9 +13,14 @@ the same device. Rules for every session:
   adb/fastboot without one, `adb -d/-e/-t`, and `-s $VAR` are refused. Skill scripts that fall back
   to a default device (listed as `script` lines in devices.conf) need `--device <name>`.
 - Your first device command gives your session a **lease** (5 min, or the Bash timeout + 1 min if
-  longer, refreshed after each command). It is dropped when your turn ends, unless one of your
-  commands is still running (e.g. in a background subagent). Drop it earlier when done:
-  `devlock release [<device>]`.
+  longer, refreshed after each command). When your turn ends it shrinks to 2 minutes, so the user's
+  next prompt still finds the device yours; it is dropped at once if another session is waiting
+  for the device, and when the session ends. Commands still running (e.g. in a background subagent)
+  keep it. Drop it earlier when done: `devlock release [<device>]`.
+- **Holding a device across turns**: only when the user asks for it (e.g. "keep the TV for me"),
+  `devlock hold [--ttl 30m] [--note "<why>"] <device>` (max 8h; run it again to extend). It ends at
+  its TTL, on `devlock release <device>`, or when this session ends. It is refused while another
+  session has the device.
 - **Long tests, background work and steps that must not be split** (install then test, reboot then
   wait): one job through `devlock run <device>[,<device2>] -- <command>`. It queues while another
   session holds a device (default limit 30 min, `--timeout SEC`, `0` = forever; exit 75 on timeout),
@@ -23,7 +28,7 @@ the same device. Rules for every session:
   Background Bash, Monitor and trailing-`&` commands that touch a device are refused unless wrapped
   like this. The run holds the devices until its whole process group exits.
   A single quoted command runs through `bash -c`; list every device the job touches.
-- `devlock status` shows who holds what. `adb kill-server` / `adb disconnect` (no address) are refused
+- `devlock status` shows who holds what and who is waiting. `adb kill-server` / `adb disconnect` (no address) are refused
   while another session uses any device.
 - **Never work around a refusal** (other spellings, deleting state files, `adb -d`). Queue with
   `devlock run`, use another device, or ask the user.

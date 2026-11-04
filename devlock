@@ -6,10 +6,12 @@
                      (a single COMMAND argument runs through bash -c)
   devlock wait [--timeout SEC] DEVICE[,DEVICE...]
                      block until no other session holds the devices
-  devlock status     who holds which device
+  devlock hold [--ttl 30m] [--note TEXT] DEVICE[,DEVICE...]
+                     keep the devices for this session across turns (max 8h; again = extend)
+  devlock status     who holds which device, and who is waiting
   devlock release [DEVICE]
-                     drop this session's short-work leases (all devices without DEVICE)
-  devlock hook pre|post|stop
+                     drop this session's leases and holds (all devices without DEVICE)
+  devlock hook pre|post|stop|end
                      Claude Code hooks (JSON on stdin)
 
 State: $DEVLOCK_DIR (default ~/.local/state/devlock). Device names: devices.conf there.
@@ -29,6 +31,9 @@ STATE = os.environ.get("DEVLOCK_DIR") or os.path.expanduser("~/.local/state/devl
 CONF = os.environ.get("DEVLOCK_CONF") or os.path.join(STATE, "devices.conf")
 LEASE_SEC = int(os.environ.get("DEVLOCK_LEASE_SEC", "300"))
 LEASE_MARGIN = 60
+STICKY_SEC = int(os.environ.get("DEVLOCK_STICKY_SEC", "120"))
+HOLD_DEFAULT_SEC = 1800
+HOLD_MAX_SEC = int(os.environ.get("DEVLOCK_HOLD_MAX", str(8 * 3600)))
 BASH_DEFAULT_TIMEOUT_MS = 120000
 RUN_DEFAULT_TIMEOUT = 1800
 SELF = os.path.abspath(__file__)
@@ -193,6 +198,22 @@ def lease(serial, now=None):
     return None
 
 
+def hold(serial, now=None):
+    data = read_json(path(serial, "hold"))
+    if data and data.get("until", 0) > (now or time.time()):
+        return data
+    return None
+
+
+def waiters(serial):
+    """Live `devlock run` / `wait` processes waiting for this device."""
+    return [e for e in (read_json(path(serial, "queue")) or []) if alive(e)]
+
+
+def clock(t):
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
 def describe(e):
     return f"session={e.get('session')} pid={e.get('pid')} since={e.get('since')} cmd={e.get('cmd')}"
 
@@ -203,30 +224,51 @@ def blockers(serials, sess, now=None):
         for e in runs(s):
             if e.get("session") != sess:
                 out.append(f"{s}: another session's run holds it ({describe(e)})")
+        h = hold(s, now)
+        if h and h.get("session") != sess:
+            note = f" ({h['note']})" if h.get("note") else ""
+            out.append(f"{s}: held by session {h['session']} until {clock(h['until'])}{note}")
         l = lease(s, now)
         if l and l.get("session") != sess:
-            out.append(f"{s}: in use by session {l['session']} until "
-                       f"{time.strftime('%H:%M:%S', time.localtime(l['until']))} at the latest")
+            out.append(f"{s}: in use by session {l['session']} until {clock(l['until'])} at the latest")
     return out
 
 
 def known_serials():
     if not os.path.isdir(STATE):
         return []
-    return sorted({f.rsplit(".", 1)[0] for f in os.listdir(STATE) if f.endswith((".runs", ".lease"))})
+    return sorted({f.rsplit(".", 1)[0] for f in os.listdir(STATE) if f.endswith((".runs", ".lease", ".hold", ".queue"))})
 
 
-def release_leases(sess, only=None, keep_inflight=False):
+def release(sess, only=None, holds=True, hold_kinds=None):
+    """Drop the session's leases and, with holds, its holds (of hold_kinds, or all)."""
     now = time.time()
     for s in known_serials():
         if only and s != fname(canon(only)):
             continue
         l = lease(s, now)
+        if l and l.get("session") == sess:
+            write_json(path(s, "lease"), None)
+        h = hold(s, now)
+        if holds and h and h.get("session") == sess and (hold_kinds is None or h.get("kind") in hold_kinds):
+            write_json(path(s, "hold"), None)
+
+
+def end_turn(sess):
+    """A lease outlives the turn by STICKY_SEC, so the session's next prompt keeps the device - unless
+    another session is waiting for it. Leases of commands still running (a background subagent) stay."""
+    now = time.time()
+    for s in known_serials():
+        l = lease(s, now)
         if not l or l.get("session") != sess:
             continue
-        if keep_inflight and any(d > now for d in (l.get("inflight") or {}).values()):
+        if any(d > now for d in (l.get("inflight") or {}).values()):
             continue
-        write_json(path(s, "lease"), None)
+        until = min(l["until"], now + STICKY_SEC)
+        if until <= now or any(w.get("session") != sess for w in waiters(s)):
+            write_json(path(s, "lease"), None)
+        else:
+            write_json(path(s, "lease"), dict(l, until=until, idle=True))
 
 
 # ---------------------------------------------------------------- command analysis
@@ -652,8 +694,11 @@ def hook(mode):
     sess = data["session_id"]
     if mode == "stop":
         with mutex():
-            # Leases of commands still running (e.g. in a background subagent) outlive the turn.
-            release_leases(sess, keep_inflight=True)
+            end_turn(sess)
+        return 0
+    if mode == "end":
+        with mutex():
+            release(sess, hold_kinds={"claude"})
         return 0
     tool = data.get("tool_name", "Bash")
     ti = data.get("tool_input") or {}
@@ -727,31 +772,46 @@ def parse_devices_timeout(argv, default_timeout):
 
 
 def acquire(serials, sess, timeout, entry=None):
-    """Wait until no other session holds the devices; with entry, register it as a run on them."""
+    """Wait until no other session holds the devices; with entry, register it as a run on them.
+    While waiting, a ticket in <device>.queue tells holders that someone is waiting."""
     deadline = time.time() + timeout if timeout else None
-    announced = False
-    while True:
-        with mutex(30):
-            busy = blockers(serials, sess)
-            if not busy:
-                if entry:
+    me = os.getpid()
+    ticket = None
+    try:
+        while True:
+            with mutex(30):
+                busy = blockers(serials, sess)
+                if not busy:
+                    if entry:
+                        for s in serials:
+                            write_json(path(s, "runs"), runs(s) + [entry])
+                    return
+                if ticket is None:
+                    ticket = {"session": sess, "pid": me, "since": time.strftime("%T"),
+                              "cmd": (entry or {}).get("cmd", "devlock wait"), "procs": [[me, proc_start(me)]]}
                     for s in serials:
-                        write_json(path(s, "runs"), runs(s) + [entry])
-                return
-        if not announced:
-            print(f"[devlock] busy: {'; '.join(busy)}; queued", file=sys.stderr, flush=True)
-            announced = True
-        if deadline and time.time() > deadline:
-            print(f"[devlock] gave up after {timeout:.0f}s waiting for {', '.join(serials)}", file=sys.stderr)
-            sys.exit(75)
-        time.sleep(1)
+                        write_json(path(s, "queue"), waiters(s) + [ticket])
+                    print(f"[devlock] busy: {'; '.join(busy)}; queued", file=sys.stderr, flush=True)
+            if deadline and time.time() > deadline:
+                print(f"[devlock] gave up after {timeout:.0f}s waiting for {', '.join(serials)}", file=sys.stderr)
+                sys.exit(75)
+            time.sleep(1)
+    finally:
+        if ticket is not None:
+            update_entries(serials, me, "queue")
+
+
+def update_entries(serials, pid, ext, entry=None):
+    """Replace this process's entry in each device's .runs / .queue list (remove it without entry)."""
+    live = runs if ext == "runs" else waiters
+    with mutex(30):
+        for s in serials:
+            others = [e for e in live(s) if e.get("pid") != pid]
+            write_json(path(s, ext), others + ([entry] if entry else []))
 
 
 def update_run(serials, pid, entry=None):
-    with mutex(30):
-        for s in serials:
-            others = [e for e in runs(s) if e.get("pid") != pid]
-            write_json(path(s, "runs"), others + ([entry] if entry else []))
+    update_entries(serials, pid, "runs", entry)
 
 
 def adb_name(name):
@@ -819,17 +879,67 @@ def cmd_wait(argv):
     return 0
 
 
+def parse_ttl(v):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", v or "")
+    if not m:
+        sys.exit(f"devlock hold: bad --ttl {v!r} (e.g. 90s, 30m, 2h)")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def cmd_hold(argv):
+    ttl, note, names, i = HOLD_DEFAULT_SEC, "", [], 0
+    while i < len(argv):
+        if argv[i] in ("--ttl", "--note") and i + 1 < len(argv):
+            if argv[i] == "--ttl":
+                ttl = parse_ttl(argv[i + 1])
+            else:
+                note = argv[i + 1]
+            i += 2
+            continue
+        names += [x for x in argv[i].split(",") if x]
+        i += 1
+    if not names:
+        sys.exit("devlock hold: name at least one device")
+    if not 0 < ttl <= HOLD_MAX_SEC:
+        sys.exit(f"devlock hold: --ttl must be between 1s and {HOLD_MAX_SEC // 3600}h")
+    sess = session_id()
+    serials = sorted({canon(n) for n in names})
+    until = time.time() + ttl
+    with mutex(30):
+        busy = blockers(serials, sess)
+        if busy:
+            print(f"devlock hold: busy - {'; '.join(busy)}. Wait for it with `devlock wait "
+                  f"{','.join(serials)}`, then hold.", file=sys.stderr)
+            return 1
+        kind = "claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "shell"
+        for s in serials:
+            write_json(path(s, "hold"), {"session": sess, "kind": kind, "until": until, "note": note,
+                                         "since": time.strftime("%T")})
+    print(f"[devlock] holding {', '.join(serials)} until {clock(until)}"
+          f"{' (ends with this Claude session)' if kind == 'claude' else ''}; release with `devlock release`")
+    return 0
+
+
 def cmd_status():
     sess = session_id()
     shown = False
+    mine = lambda e: "  (this session)" if e.get("session") == sess else ""
     for s in known_serials():
         for e in runs(s):
-            print(f"{s}  run: {describe(e)}{'  (this session)' if e.get('session') == sess else ''}")
+            print(f"{s}  run: {describe(e)}{mine(e)}")
+            shown = True
+        h = hold(s)
+        if h:
+            note = f" note={h['note']!r}" if h.get("note") else ""
+            print(f"{s}  hold: session={h['session']} until {clock(h['until'])}{note}{mine(h)}")
             shown = True
         l = lease(s)
         if l:
-            print(f"{s}  lease: session={l['session']} until {time.strftime('%T', time.localtime(l['until']))}"
-                  f"{'  (this session)' if l['session'] == sess else ''}")
+            idle = " (idle after its turn)" if l.get("idle") else ""
+            print(f"{s}  lease: session={l['session']} until {clock(l['until'])}{idle}{mine(l)}")
+            shown = True
+        for n, e in enumerate(waiters(s), 1):
+            print(f"{s}  waiting #{n}: {describe(e)}{mine(e)}")
             shown = True
     if not shown:
         print("all devices free")
@@ -853,9 +963,11 @@ def main():
         return cmd_wait(a[1:])
     if a[:1] == ["status"]:
         return cmd_status()
+    if a[:1] == ["hold"]:
+        return cmd_hold(a[1:])
     if a[:1] == ["release"]:
         with mutex():
-            release_leases(session_id(), a[1] if len(a) > 1 else None)
+            release(session_id(), a[1] if len(a) > 1 else None)
         return 0
     print(__doc__.strip())
     return 1

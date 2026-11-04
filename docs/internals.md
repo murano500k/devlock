@@ -13,15 +13,17 @@ How devlock works and why it is built this way. For behaviour see [reference.md]
   files under one lock. Nothing to keep running, nothing to restart after a crash.
 - **Never block all work.** A bug in devlock must not stop every Bash call, so the hook fails open
   on its own errors.
-- **Short holds by default.** A session holds a device while it works on it, not for its whole
-  life, so idle sessions do not keep devices from others.
+- **Short holds by default.** A session holds a device while it works on it, plus a 2-minute
+  window after its turn for the user's next prompt. Idle sessions do not keep devices from others,
+  and a waiting job ends the window at once. Longer holds are explicit (`devlock hold`).
 
 ## Components
 
 ```
 Claude Code ── PreToolUse ──> devlock hook pre ──> parse command ──> allow / deny + take lease
             ── PostToolUse ─> devlock hook post ─> extend lease, clear in-flight call
-            ── Stop/SessionEnd > devlock hook stop ─> drop leases (keep if a call is in flight)
+            ── Stop ─────────> devlock hook stop ─> shorten leases to 2 min (drop if someone waits)
+            ── SessionEnd ───> devlock hook end ──> drop leases and Claude holds
 agent Bash ─── devlock run ──> queue ──> register run ──> command in its own process group
 ```
 
@@ -68,10 +70,26 @@ then collide. It is written with:
 - `until`: the latest moment it is valid;
 - `inflight`: one deadline per running tool call, keyed by `tool_use_id`.
 
-`post` removes the call from `inflight` and extends `until`. `stop` drops the session's leases
-unless a deadline in `inflight` is still in the future. That covers a background subagent whose
-command is still running when the main turn ends. A lease that nobody refreshes simply expires, so
-a crashed session frees its devices within one lease period.
+`post` removes the call from `inflight` and extends `until`. `stop` leaves a lease alone while a
+deadline in `inflight` is still in the future, which covers a background subagent whose command is
+still running when the main turn ends. Otherwise it shortens the lease to the sticky window and
+marks it `idle`, or drops it when another session's ticket is in `<device>.queue`. `end` drops the
+session's leases outright. A lease that nobody refreshes simply expires, so a crashed session frees
+its devices within one lease period.
+
+## Holds
+
+A hold is a lease with an explicit end time and no renewal: `devlock hold` writes `<device>.hold`
+after checking, under the lock, that no other session has the device. The hook and the CLI treat it
+like any other holder. Its `kind` records whether it was taken inside Claude Code; `end` drops only
+those, so a hold taken by hand in a terminal is not lost when some Claude session closes.
+
+## Waiting tickets
+
+`devlock run` and `devlock wait` add a ticket to `<device>.queue` when they first find a device
+busy, and remove it when they get the devices, give up or exit. A ticket is alive by the same pid
+and start time check as a run, so a killed waiter disappears without cleanup. Tickets only tell a
+holder that someone is waiting; who gets the device next is still decided by polling.
 
 ## Runs
 
@@ -116,8 +134,9 @@ registers the run as soon as there are none.
 - **One machine.** State is local files.
 - **Advisory.** Commands outside Claude Code, and scripts that call adb without naming the device
   in the command text, are not seen.
-- **Waiting is not fair.** A session making back-to-back foreground calls keeps renewing its
-  lease, and a queued `devlock run` can wait until its timeout.
+- **Waiting is not fair.** Waiting jobs poll; whoever checks first after the device frees up gets
+  it. A session making back-to-back foreground calls keeps renewing its lease, and a queued
+  `devlock run` can wait until its timeout.
 
 ## Tests
 

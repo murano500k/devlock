@@ -5,6 +5,8 @@ DL=$(cd "$(dirname "$0")/.." && pwd)/devlock
 export DEVLOCK_DIR=$(mktemp -d)
 trap 'rm -rf "$DEVLOCK_DIR"' EXIT
 unset DEVLOCK_CONF
+# stop frees at once unless a test sets the sticky window itself
+export DEVLOCK_STICKY_SEC=0
 cat > "$DEVLOCK_DIR/devices.conf" <<'EOF'
 # serial, then other names
 SER1 10.0.0.2:5555 10.0.0.2 tva
@@ -25,7 +27,8 @@ hook() {
 allow() { local o; o=$(hook pre "$@"); [[ "$o" != *deny* ]] && ok "allow: ${2%%$'\n'*} [$1]" || bad "allow: ${2%%$'\n'*} [$1]" "$o"; }
 deny()  { local o; o=$(hook pre "$@"); [[ "$o" == *deny* ]] && ok "deny:  ${2%%$'\n'*} [$1]" || bad "deny:  ${2%%$'\n'*} [$1]" "no deny"; }
 stop()  { jq -nc --arg s "$1" '{session_id: $s}' | "$DL" hook stop; }
-reset() { stop A; stop B; stop C; }
+end()   { jq -nc --arg s "$1" '{session_id: $s}' | "$DL" hook end; }
+reset() { end A; end B; end C; }
 
 # --- naming
 deny  A 'adb shell getprop'
@@ -276,6 +279,70 @@ reset
 allow A 'adb -s SER1 shell true' '{"timeout": "600000"}'
 allow B 'adb -s SER2 shell true' '{"timeout": "soon"}'
 [ "$(jq -r .session "$DEVLOCK_DIR/SER2.lease")" = B ] && ok "non-numeric timeout still takes a lease" || bad "non-numeric timeout still takes a lease"
+reset
+
+# --- sticky window: a lease outlives the turn by DEVLOCK_STICKY_SEC
+hook pre A 'adb -s SER1 shell true' >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+deny  B 'adb -s SER1 shell true'
+left=$(( $(jq '.until | floor' "$DEVLOCK_DIR/SER1.lease") - $(date +%s) ))
+[ $left -le 120 ] && [ $left -ge 100 ] && [ "$(jq .idle "$DEVLOCK_DIR/SER1.lease")" = true ] \
+	&& ok "stop keeps the lease ~2 min, marked idle" || bad "stop keeps the lease ~2 min, marked idle" "left=$left"
+"$DL" status | grep -q 'SER1  lease: session=A .*idle' && ok "status shows idle lease" || bad "status shows idle lease"
+allow A 'adb -s SER1 shell true'
+[ "$(jq .idle "$DEVLOCK_DIR/SER1.lease")" = null ] && ok "next command of the holder renews it" || bad "next command of the holder renews it"
+end A
+allow B 'adb -s SER1 shell true'
+reset
+# ... but not when another session is waiting for the device
+hook pre A 'adb -s SER1 shell true' >/dev/null
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 20 SER1 -- true 2>/dev/null &
+runpid=$!
+sleep 1.5
+"$DL" status | grep -q 'SER1  waiting #1: session=B' && ok "status shows the waiting run" || bad "status shows the waiting run"
+t0=$(date +%s)
+DEVLOCK_STICKY_SEC=120 stop A
+wait $runpid; rc=$?
+[ $rc = 0 ] && [ $(( $(date +%s) - t0 )) -le 3 ] && ok "a waiting run gets the device when the holder's turn ends" || bad "a waiting run gets the device when the holder's turn ends" "rc=$rc"
+[ "$(jq length "$DEVLOCK_DIR/SER1.queue")" = 0 ] && ok "the waiting ticket is removed" || bad "the waiting ticket is removed"
+reset
+# a timed-out waiter leaves the queue
+hook pre A 'adb -s SER1 shell true' >/dev/null
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 1 SER1 -- true 2>/dev/null
+[ "$(jq length "$DEVLOCK_DIR/SER1.queue")" = 0 ] && ok "timed-out waiter leaves the queue" || bad "timed-out waiter leaves the queue"
+reset
+# end of session frees at once, even with a call still in flight
+jq -nc '{session_id: "A", tool_use_id: "t9", tool_name: "Bash", tool_input: {command: "adb -s SER1 shell sleep 100"}}' | "$DL" hook pre >/dev/null
+DEVLOCK_STICKY_SEC=120 end A
+allow B 'adb -s SER1 shell true'
+reset
+
+# --- hold
+CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 10m --note "cec test" tva >/dev/null && ok "hold" || bad "hold"
+o=$(hook pre B 'adb -s SER1 shell true')
+[[ "$o" == *"held by session A"*"cec test"* ]] && ok "a hold blocks others and names the note" || bad "a hold blocks others and names the note" "$o"
+DEVLOCK_STICKY_SEC=120 stop A
+deny  B 'adb -s 10.0.0.2:5555 shell true'
+allow A 'adb -s SER1 shell true'
+"$DL" status | grep -q "SER1  hold: session=A until .* note='cec test'" && ok "status shows the hold" || bad "status shows the hold"
+CLAUDE_CODE_SESSION_ID=B "$DL" hold SER1 2>/dev/null; [ $? = 1 ] && ok "hold on a busy device is refused" || bad "hold on a busy device is refused"
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 1 SER1 -- true 2>/dev/null; [ $? = 75 ] && ok "a run waits for a hold" || bad "a run waits for a hold"
+end A
+allow B 'adb -s SER1 shell true'
+reset
+# a hold from a terminal survives session ends, ends on release or expiry
+env -u CLAUDE_CODE_SESSION_ID "$DL" hold SER2 >/dev/null
+end A; end B
+deny  B 'adb -s SER2 shell true'
+env -u CLAUDE_CODE_SESSION_ID "$DL" release SER2
+allow B 'adb -s SER2 shell true'
+reset
+CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 90s DONGLE >/dev/null
+jq -c '.until = 1' "$DEVLOCK_DIR/DONGLE.hold" > "$DEVLOCK_DIR/x" && mv "$DEVLOCK_DIR/x" "$DEVLOCK_DIR/DONGLE.hold"
+allow B 'adb -s DONGLE shell true'
+reset
+CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 9h SER1 2>/dev/null && bad "hold over the max is refused" || ok "hold over the max is refused"
+CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 5x SER1 2>/dev/null && bad "bad --ttl is refused" || ok "bad --ttl is refused"
 reset
 
 # --- release
