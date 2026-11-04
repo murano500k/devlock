@@ -32,7 +32,6 @@ CONF = os.environ.get("DEVLOCK_CONF") or os.path.join(STATE, "devices.conf")
 LEASE_SEC = int(os.environ.get("DEVLOCK_LEASE_SEC", "300"))
 LEASE_MARGIN = 60
 STICKY_SEC = int(os.environ.get("DEVLOCK_STICKY_SEC", "120"))
-HOLD_DEFAULT_SEC = 1800
 HOLD_MAX_SEC = int(os.environ.get("DEVLOCK_HOLD_MAX", str(8 * 3600)))
 BASH_DEFAULT_TIMEOUT_MS = 120000
 RUN_DEFAULT_TIMEOUT = 1800
@@ -218,7 +217,9 @@ def describe(e):
     return f"session={e.get('session')} pid={e.get('pid')} since={e.get('since')} cmd={e.get('cmd')}"
 
 
-def blockers(serials, sess, now=None):
+def blockers(serials, sess, now=None, skip_idle=False):
+    """Why the devices are not free for sess. skip_idle: a lease kept only for its session's next
+    prompt (the sticky window) does not count - queued work takes precedence over it."""
     out = []
     for s in serials:
         for e in runs(s):
@@ -229,7 +230,7 @@ def blockers(serials, sess, now=None):
             note = f" ({h['note']})" if h.get("note") else ""
             out.append(f"{s}: held by session {h['session']} until {clock(h['until'])}{note}")
         l = lease(s, now)
-        if l and l.get("session") != sess:
+        if l and l.get("session") != sess and not (skip_idle and l.get("idle")):
             out.append(f"{s}: in use by session {l['session']} until {clock(l['until'])} at the latest")
     return out
 
@@ -241,7 +242,6 @@ def known_serials():
 
 
 def release(sess, only=None, holds=True, hold_kinds=None):
-    """Drop the session's leases and, with holds, its holds (of hold_kinds, or all)."""
     now = time.time()
     for s in known_serials():
         if only and s != fname(canon(only)):
@@ -254,21 +254,38 @@ def release(sess, only=None, holds=True, hold_kinds=None):
             write_json(path(s, "hold"), None)
 
 
+def someone_waits(serial, sess):
+    """Another session's run/wait is queued for this device and could take it now: a multi-device
+    waiter still blocked on one of its other devices does not count."""
+    for w in waiters(serial):
+        if w.get("session") == sess:
+            continue
+        others = [d for d in w.get("devices") or [] if d != serial]
+        if not blockers(others, w.get("session"), skip_idle=True):
+            return True
+    return False
+
+
+def idle_lease(serial, l, sess, now):
+    """The lease after its session's turn: kept STICKY_SEC for the next prompt, or dropped when
+    someone is waiting for the device."""
+    until = min(l["until"], now + STICKY_SEC)
+    if until <= now or someone_waits(serial, sess):
+        return None
+    return {"session": sess, "until": until, "inflight": {}, "idle": True}
+
+
 def end_turn(sess):
-    """A lease outlives the turn by STICKY_SEC, so the session's next prompt keeps the device - unless
-    another session is waiting for it. Leases of commands still running (a background subagent) stay."""
     now = time.time()
     for s in known_serials():
         l = lease(s, now)
         if not l or l.get("session") != sess:
             continue
         if any(d > now for d in (l.get("inflight") or {}).values()):
+            # a command still running (e.g. in a background subagent): its post hook ends the turn
+            write_json(path(s, "lease"), dict(l, turn_ended=True))
             continue
-        until = min(l["until"], now + STICKY_SEC)
-        if until <= now or any(w.get("session") != sess for w in waiters(s)):
-            write_json(path(s, "lease"), None)
-        else:
-            write_json(path(s, "lease"), dict(l, until=until, idle=True))
+        write_json(path(s, "lease"), idle_lease(s, l, sess, now))
 
 
 # ---------------------------------------------------------------- command analysis
@@ -692,6 +709,8 @@ def hook(mode):
     if not isinstance(data, dict) or not data.get("session_id"):
         return 0
     sess = data["session_id"]
+    if data.get("hook_event_name") == "SessionEnd":
+        mode = "end"
     if mode == "stop":
         with mutex():
             end_turn(sess)
@@ -718,6 +737,10 @@ def hook(mode):
                     continue
                 l = l or {"session": sess, "until": 0}
                 inflight = {k: v for k, v in (l.get("inflight") or {}).items() if k != call and v > now}
+                if l.get("turn_ended"):
+                    write_json(path(s, "lease"), dict(l, inflight=inflight) if inflight
+                               else idle_lease(s, l, sess, now))
+                    continue
                 write_json(path(s, "lease"), {"session": sess, "until": max(l["until"], now + LEASE_SEC),
                                               "inflight": inflight})
         return 0
@@ -758,36 +781,57 @@ def hook(mode):
 
 # ---------------------------------------------------------------- CLI
 
-def parse_devices_timeout(argv, default_timeout):
-    timeout, names, i = default_timeout, [], 0
+def parse_device_args(cmd, argv, opts):
+    """`[--opt VALUE]... DEVICE[,DEVICE]... [-- COMMAND...]` -> (option values, device names, command).
+    opts maps each option to its default."""
+    vals, names, i = dict(opts), [], 0
     while i < len(argv) and argv[i] != "--":
-        if argv[i] == "--timeout" and i + 1 < len(argv):
-            timeout, i = float(argv[i + 1]), i + 2
+        a = argv[i]
+        if a in opts:
+            if i + 1 >= len(argv) or argv[i + 1] == "--":
+                sys.exit(f"devlock {cmd}: {a} needs a value")
+            vals[a], i = argv[i + 1], i + 2
             continue
-        names += [x for x in argv[i].split(",") if x]
+        if a.startswith("--"):
+            sys.exit(f"devlock {cmd}: unknown option {a}")
+        names += [x for x in a.split(",") if x]
         i += 1
     if not names:
-        sys.exit("devlock: name at least one device")
-    return timeout, names, argv[i + 1:]
+        sys.exit(f"devlock {cmd}: name at least one device")
+    return vals, names, argv[i + 1:]
 
 
-def acquire(serials, sess, timeout, entry=None):
+def parse_seconds(cmd, opt, v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        sys.exit(f"devlock {cmd}: bad {opt} {v!r}")
+
+
+def acquire(serials, sess, timeout, entry=None, cancelled=lambda: False):
     """Wait until no other session holds the devices; with entry, register it as a run on them.
-    While waiting, a ticket in <device>.queue tells holders that someone is waiting."""
+    While waiting, a ticket in <device>.queue tells holders that someone is waiting. A run (entry)
+    takes over other sessions' idle leases; a plain wait does not, since it takes nothing.
+    Returns False when cancelled() turned true while waiting."""
     deadline = time.time() + timeout if timeout else None
     me = os.getpid()
     ticket = None
     try:
         while True:
+            if cancelled():
+                return False
             with mutex(30):
-                busy = blockers(serials, sess)
+                busy = blockers(serials, sess, skip_idle=bool(entry))
                 if not busy:
                     if entry:
                         for s in serials:
+                            l = lease(s)
+                            if l and l.get("session") != sess:
+                                write_json(path(s, "lease"), None)
                             write_json(path(s, "runs"), runs(s) + [entry])
-                    return
+                    return True
                 if ticket is None:
-                    ticket = {"session": sess, "pid": me, "since": time.strftime("%T"),
+                    ticket = {"session": sess, "pid": me, "since": time.strftime("%T"), "devices": serials,
                               "cmd": (entry or {}).get("cmd", "devlock wait"), "procs": [[me, proc_start(me)]]}
                     for s in serials:
                         write_json(path(s, "queue"), waiters(s) + [ticket])
@@ -802,7 +846,6 @@ def acquire(serials, sess, timeout, entry=None):
 
 
 def update_entries(serials, pid, ext, entry=None):
-    """Replace this process's entry in each device's .runs / .queue list (remove it without entry)."""
     live = runs if ext == "runs" else waiters
     with mutex(30):
         for s in serials:
@@ -827,7 +870,8 @@ def adb_name(name):
 
 
 def cmd_run(argv):
-    timeout, names, command = parse_devices_timeout(argv, RUN_DEFAULT_TIMEOUT)
+    opts, names, command = parse_device_args("run", argv, {"--timeout": RUN_DEFAULT_TIMEOUT})
+    timeout = parse_seconds("run", "--timeout", opts["--timeout"])
     if not command:
         sys.exit("devlock run: missing -- COMMAND")
     serials = sorted({canon(n) for n in names})
@@ -845,7 +889,7 @@ def cmd_run(argv):
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, forward)
-    acquire(serials, entry["session"], timeout, entry)
+    acquire(serials, entry["session"], timeout, entry, cancelled=lambda: bool(pending))
     try:
         if pending:
             return 128 + pending[0]
@@ -874,8 +918,13 @@ def cmd_run(argv):
 
 
 def cmd_wait(argv):
-    timeout, names, _ = parse_devices_timeout(argv, 0)
-    acquire(sorted({canon(n) for n in names}), session_id(), timeout)
+    opts, names, _ = parse_device_args("wait", argv, {"--timeout": 0})
+    timeout = parse_seconds("wait", "--timeout", opts["--timeout"])
+    pending = []
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda n, _: pending.append(n))
+    if not acquire(sorted({canon(n) for n in names}), session_id(), timeout, cancelled=lambda: bool(pending)):
+        return 128 + pending[0]
     return 0
 
 
@@ -887,26 +936,17 @@ def parse_ttl(v):
 
 
 def cmd_hold(argv):
-    ttl, note, names, i = HOLD_DEFAULT_SEC, "", [], 0
-    while i < len(argv):
-        if argv[i] in ("--ttl", "--note") and i + 1 < len(argv):
-            if argv[i] == "--ttl":
-                ttl = parse_ttl(argv[i + 1])
-            else:
-                note = argv[i + 1]
-            i += 2
-            continue
-        names += [x for x in argv[i].split(",") if x]
-        i += 1
-    if not names:
-        sys.exit("devlock hold: name at least one device")
+    opts, names, _ = parse_device_args("hold", argv, {"--ttl": "30m", "--note": ""})
+    ttl, note = parse_ttl(opts["--ttl"]), opts["--note"]
     if not 0 < ttl <= HOLD_MAX_SEC:
         sys.exit(f"devlock hold: --ttl must be between 1s and {HOLD_MAX_SEC // 3600}h")
     sess = session_id()
     serials = sorted({canon(n) for n in names})
     until = time.time() + ttl
     with mutex(30):
-        busy = blockers(serials, sess)
+        busy = blockers(serials, sess) + [
+            f"{s}: {len(q)} job(s) of other sessions waiting for it"
+            for s in serials for q in [[w for w in waiters(s) if w.get("session") != sess]] if q]
         if busy:
             print(f"devlock hold: busy - {'; '.join(busy)}. Wait for it with `devlock wait "
                   f"{','.join(serials)}`, then hold.", file=sys.stderr)

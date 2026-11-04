@@ -306,6 +306,20 @@ wait $runpid; rc=$?
 [ $rc = 0 ] && [ $(( $(date +%s) - t0 )) -le 3 ] && ok "a waiting run gets the device when the holder's turn ends" || bad "a waiting run gets the device when the holder's turn ends" "rc=$rc"
 [ "$(jq length "$DEVLOCK_DIR/SER1.queue")" = 0 ] && ok "the waiting ticket is removed" || bad "the waiting ticket is removed"
 reset
+# a run that starts waiting after the turn ended does not wait out the window
+hook pre A 'adb -s SER1 shell true' >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+t0=$(date +%s)
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 10 SER1 -- true 2>/dev/null
+[ $? = 0 ] && [ $(( $(date +%s) - t0 )) -le 2 ] && ok "a later run takes over an idle lease at once" || bad "a later run takes over an idle lease at once"
+allow B 'adb -s SER1 shell true'
+reset
+# but a plain command of another session does not
+hook pre A 'adb -s SER1 shell true' >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+deny  B 'adb -s SER1 shell true'
+CLAUDE_CODE_SESSION_ID=B "$DL" hold SER1 2>/dev/null; [ $? = 1 ] && ok "hold does not take over an idle lease" || bad "hold does not take over an idle lease"
+reset
 # a timed-out waiter leaves the queue
 hook pre A 'adb -s SER1 shell true' >/dev/null
 CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 1 SER1 -- true 2>/dev/null
@@ -343,6 +357,64 @@ allow B 'adb -s DONGLE shell true'
 reset
 CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 9h SER1 2>/dev/null && bad "hold over the max is refused" || ok "hold over the max is refused"
 CLAUDE_CODE_SESSION_ID=A "$DL" hold --ttl 5x SER1 2>/dev/null && bad "bad --ttl is refused" || ok "bad --ttl is refused"
+reset
+
+# --- review fixes
+# devlock wait takes nothing, so it does not clear another session's idle lease
+hook pre A 'adb -s SER1 shell true' >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+CLAUDE_CODE_SESSION_ID=B "$DL" wait --timeout 2 SER1 2>/dev/null; rc=$?
+[ $rc = 75 ] && [ "$(jq -r .session "$DEVLOCK_DIR/SER1.lease")" = A ] && ok "wait keeps out of an idle lease" || bad "wait keeps out of an idle lease" "rc=$rc"
+reset
+# a multi-device waiter blocked on its other device does not cut the window short
+CLAUDE_CODE_SESSION_ID=C "$DL" hold SER2 >/dev/null
+hook pre A 'adb -s SER1 shell true' >/dev/null
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 20 SER1,SER2 -- true 2>/dev/null & runpid=$!
+sleep 1.5
+DEVLOCK_STICKY_SEC=120 stop A
+[ "$(jq .idle "$DEVLOCK_DIR/SER1.lease")" = true ] && ok "waiter blocked elsewhere: window kept" || bad "waiter blocked elsewhere: window kept"
+CLAUDE_CODE_SESSION_ID=D "$DL" hold SER1 2>/dev/null; [ $? = 1 ] && ok "hold refused while a job waits for the device" || bad "hold refused while a job waits for the device"
+kill $runpid; wait $runpid 2>/dev/null
+end C; reset
+# SessionEnd sent to an older `hook stop` registration still ends the session
+CLAUDE_CODE_SESSION_ID=A "$DL" hold SER1 >/dev/null
+hook pre A 'adb -s SER2 shell true' >/dev/null
+jq -nc '{session_id: "A", hook_event_name: "SessionEnd"}' | DEVLOCK_STICKY_SEC=120 "$DL" hook stop
+allow B 'adb -s SER1 shell true'
+allow B 'adb -s SER2 shell true'
+reset
+# a command still running at the end of the turn: its post hook ends the turn
+jq -nc '{session_id: "A", tool_use_id: "t5", tool_name: "Bash", tool_input: {command: "adb -s SER1 shell sleep 9"}}' | "$DL" hook pre >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+jq -nc '{session_id: "A", tool_use_id: "t5", tool_name: "Bash", tool_input: {command: "adb -s SER1 shell sleep 9"}}' | DEVLOCK_STICKY_SEC=120 "$DL" hook post
+left=$(( $(jq '.until | floor' "$DEVLOCK_DIR/SER1.lease") - $(date +%s) ))
+[ "$(jq .idle "$DEVLOCK_DIR/SER1.lease")" = true ] && [ $left -le 120 ] && ok "late post after the turn leaves an idle lease" || bad "late post after the turn leaves an idle lease" "$(cat "$DEVLOCK_DIR/SER1.lease")"
+reset
+jq -nc '{session_id: "A", tool_use_id: "t6", tool_name: "Bash", tool_input: {command: "adb -s SER1 shell sleep 9"}}' | "$DL" hook pre >/dev/null
+DEVLOCK_STICKY_SEC=120 stop A
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 20 SER1 -- true 2>/dev/null & runpid=$!
+sleep 1.5
+t0=$(date +%s)
+jq -nc '{session_id: "A", tool_use_id: "t6", tool_name: "Bash", tool_input: {command: "adb -s SER1 shell sleep 9"}}' | DEVLOCK_STICKY_SEC=120 "$DL" hook post
+wait $runpid; rc=$?
+[ $rc = 0 ] && [ $(( $(date +%s) - t0 )) -le 3 ] && ok "late post hands the device to a waiting run" || bad "late post hands the device to a waiting run" "rc=$rc"
+reset
+# SIGTERM to a waiting run: it leaves the queue at once and never takes the device
+hook pre A 'adb -s SER1 shell true' >/dev/null
+CLAUDE_CODE_SESSION_ID=B "$DL" run --timeout 30 SER1 -- true 2>/dev/null & runpid=$!
+sleep 1.5
+t0=$(date +%s); kill -TERM $runpid; wait $runpid; rc=$?
+[ $rc = 143 ] && [ $(( $(date +%s) - t0 )) -le 2 ] && [ "$(jq length "$DEVLOCK_DIR/SER1.queue")" = 0 ] && [ "$(jq -r .session "$DEVLOCK_DIR/SER1.lease")" = A ] \
+	&& ok "SIGTERM while waiting: exits 143, leaves the queue" || bad "SIGTERM while waiting" "rc=$rc"
+CLAUDE_CODE_SESSION_ID=B "$DL" wait --timeout 30 SER1 2>/dev/null & runpid=$!
+sleep 1.5; kill -INT $runpid; wait $runpid; rc=$?
+[ $rc = 130 ] && ok "SIGINT ends a wait (130)" || bad "SIGINT ends a wait" "rc=$rc"
+reset
+# argument errors
+CLAUDE_CODE_SESSION_ID=A "$DL" hold SER1 --note 2>/dev/null && bad "hold with a dangling --note fails" || ok "hold with a dangling --note fails"
+[ ! -e "$DEVLOCK_DIR/--note.hold" ] && ok "no phantom device from a dangling option" || bad "no phantom device from a dangling option"
+CLAUDE_CODE_SESSION_ID=A "$DL" run --tiemout 5 SER1 -- true 2>/dev/null && bad "unknown option fails" || ok "unknown option fails"
+CLAUDE_CODE_SESSION_ID=A "$DL" run --timeout x SER1 -- true 2>/dev/null && bad "bad --timeout fails" || ok "bad --timeout fails"
 reset
 
 # --- release

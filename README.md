@@ -73,6 +73,8 @@ State and the decision log live in `$DEVLOCK_DIR` (default `~/.local/state/devlo
 
 - `tests/smoke.sh` - hook and run semantics on fake devices, no adb needed.
 - `tests/integration.sh` - two real `claude -p` sessions against the installed hooks.
+- `tests/device.sh SERIAL ADDRESS` - real adb, runs, holds and Claude sessions on a real device
+  (read-only commands only).
 
 ## License
 

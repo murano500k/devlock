@@ -29,14 +29,15 @@ Exit status:
 | Status | Meaning |
 |---|---|
 | status of `COMMAND` | the command ran |
-| 128 + N | the command was killed by signal N, or `devlock run` got signal N while still waiting |
+| 128 + N | the command was killed by signal N, or `devlock run` got signal N while still waiting (it then leaves the queue at once and never takes the devices) |
 | 75 | gave up waiting (`--timeout`) |
 | 127 | the command could not be started |
 
 ### `devlock wait [--timeout SEC] DEVICE[,DEVICE...]`
 
 Blocks until no other session holds any of the devices, then exits 0. It does not take the
-devices. Default timeout is 0 (forever). Exit 75 on timeout.
+devices, so another session's idle lease (sticky window) still counts as busy for it. Default
+timeout is 0 (forever). Exit 75 on timeout, 128 + N when it gets signal N while waiting.
 
 While it waits, `run` and `wait` leave a ticket in `<device>.queue`. A ticket tells the holder's
 end of turn to drop its lease at once instead of keeping the sticky window.
@@ -49,7 +50,9 @@ Keeps the devices for the calling session until the TTL ends.
   `DEVLOCK_HOLD_MAX` (8h).
 - `--note`: shown to other sessions in refusals and in `status`.
 - Running it again on a held device replaces the hold, so it extends it.
-- Exits 1, without waiting, when another session has any of the devices.
+- Exits 1, without waiting, when another session has any of the devices or has a `run`/`wait`
+  queued for one of them.
+- A missing option value or an unknown option is an error, for `run` and `wait` too.
 - A hold taken with `CLAUDE_CODE_SESSION_ID` set ends at that session's SessionEnd. A hold taken
   without it (a terminal) ends only at its TTL or on `release` from the same shell.
 
@@ -85,8 +88,12 @@ A device is busy for session S when another session has either of these:
     longer (Bash default timeout 120 s).
   - `post` extends it to at least `now + DEVLOCK_LEASE_SEC` after each command.
   - `stop` (end of turn) shortens it to at most `DEVLOCK_STICKY_SEC` (120 s) from now and marks
-    it idle. It drops it at once when another session has a `run` or `wait` waiting for the device.
-    A lease with a command still running (for example in a background subagent) is left as it is.
+    it idle. It drops it at once when another session has a `run` or `wait` waiting for the device
+    that could start now (a multi-device waiter still blocked on another device does not count).
+    A `run` or `wait` of another session that starts waiting later is not blocked by an idle lease:
+    it takes the device at once. Plain commands and `hold` of other sessions still are.
+    A lease with a command still running (for example in a background subagent) is left as it is,
+    and the `post` hook of the last such command applies the end of the turn instead.
   - `end` (end of session) drops it at once.
 - **Hold** - taken by `devlock hold`. Lasts until its TTL.
 - **Run** - registered by `devlock run`. Alive while the `devlock run` process (matched by pid and
@@ -200,7 +207,8 @@ Location: `$DEVLOCK_CONF`, default `$DEVLOCK_DIR/devices.conf` (`install.sh --co
 | `Stop` | all | `devlock hook stop` |
 | `SessionEnd` | all | `devlock hook end` |
 
-Each has a 10 s timeout. Re-running `install.sh` replaces older devlock entries and leaves other
+Each has a 10 s timeout. A SessionEnd event is handled as `end` whatever the argument, so
+installs from before `hook end` existed still release at session end. Re-running `install.sh` replaces older devlock entries and leaves other
 hooks alone.
 
 ## Files

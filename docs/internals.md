@@ -72,8 +72,11 @@ then collide. It is written with:
 
 `post` removes the call from `inflight` and extends `until`. `stop` leaves a lease alone while a
 deadline in `inflight` is still in the future, which covers a background subagent whose command is
-still running when the main turn ends. Otherwise it shortens the lease to the sticky window and
-marks it `idle`, or drops it when another session's ticket is in `<device>.queue`. `end` drops the
+still running when the main turn ends; it marks the lease `turn_ended`, and the `post` of the last
+running command then shortens or drops it as `stop` would have. Otherwise it shortens the lease to the sticky window and
+marks it `idle`, or drops it when another session's ticket is in `<device>.queue`. A `run` or
+`wait` that comes later ignores idle leases of other sessions and clears them when it takes the
+device, so queued work always beats the sticky window. `end` drops the
 session's leases outright. A lease that nobody refreshes simply expires, so a crashed session frees
 its devices within one lease period.
 
@@ -87,7 +90,9 @@ those, so a hold taken by hand in a terminal is not lost when some Claude sessio
 ## Waiting tickets
 
 `devlock run` and `devlock wait` add a ticket to `<device>.queue` when they first find a device
-busy, and remove it when they get the devices, give up or exit. A ticket is alive by the same pid
+busy, and remove it when they get the devices, give up, exit or are signalled. A ticket lists all
+devices of its job; a holder's turn end yields only to a waiter whose other devices are free.
+`hold` is refused while another session's ticket is on the device. A ticket is alive by the same pid
 and start time check as a run, so a killed waiter disappears without cleanup. Tickets only tell a
 holder that someone is waiting; who gets the device next is still decided by polling.
 
@@ -146,5 +151,11 @@ registers the run as soon as there are none.
   forwarding, queue timeouts and a 20-way race. About a minute.
 - `tests/integration.sh` - two real `claude -p` sessions against the installed hooks and a fake
   device, to check the hook wiring end to end.
+- `tests/device.sh SERIAL ADDRESS` - the same rules on a real device reachable under two names (USB
+  serial and network address): real adb commands, overlapping runs, the sticky window, holds,
+  `claude -p` sessions and one interactive Claude session in tmux (real Stop and SessionEnd hooks).
+  Sends only read-only adb commands and uses a throwaway state dir; hold the device in your real
+  state first so no other session uses it meanwhile. A few minutes; `DEVLOCK_TEST_NO_CLAUDE=1` skips
+  the Claude parts.
 
 Every change to the parser should come with `allow` or `deny` lines in `smoke.sh`.

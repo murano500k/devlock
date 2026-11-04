@@ -47,6 +47,7 @@ the same device. Rules for every session:
 
 - `tests/smoke.sh` - hook and run semantics on fake devices (no adb, ~1 min).
 - `tests/integration.sh` - two real `claude -p` sessions against the installed hooks (fake device).
+- `tests/device.sh SERIAL ADDRESS` - real device, read-only commands; hold the device first.
 
 Decisions are logged to `~/.local/state/devlock/hook.log`. The hook fails open on its own bugs
 (logged as ERROR) so a devlock fault never blocks every Bash call.
