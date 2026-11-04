@@ -55,6 +55,13 @@ WRAPPERS = {
 }
 INTERPRETERS = {"python", "python3", "node", "uv", "perl", "ruby"}
 SHELLS = {"bash", "sh", "zsh"}
+SHELL_OPTS_WITH_ARG = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+GRADLE = {"gradlew", "gradle"}
+GRADLE_OPTS_WITH_ARG = {"-p", "--project-dir", "-x", "--exclude-task", "-c", "--settings-file", "-b",
+                        "--build-file", "-I", "--init-script", "-g", "--gradle-user-home", "--console",
+                        "--warning-mode", "--include-build", "--project-cache-dir", "--priority"}
+GRADLE_DEVICE_TASK = re.compile(r"^((connected|install|uninstall)[A-Z]\w*(?<!Dist)|deviceCheck)$")
+SCRCPY_FREE = {"-v", "--version", "-h", "--help"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 ALIASES, SCRIPTS = {}, []
@@ -377,11 +384,17 @@ def literal(v):
 
 
 def env_assignments(toks, k):
-    """ANDROID_SERIAL values set by this simple command (prefix assignments, env, export)."""
-    vals = [t.split("=", 1)[1] for t in toks[:k] if t.startswith("ANDROID_SERIAL=")]
-    if k < len(toks) and toks[k] in ("export", "declare", "local", "typeset"):
-        vals += [t.split("=", 1)[1] for t in toks[k + 1:] if t.startswith("ANDROID_SERIAL=")]
-    return [v for v in vals if v]
+    """ANDROID_SERIAL set by this simple command: (values for this command only, values for the
+    commands after it, whether it unsets it). A prefix assignment or `env` applies to its own
+    command; export / declare and a bare assignment last."""
+    def vals(ts):
+        return [t.split("=", 1)[1] for t in ts if t.startswith("ANDROID_SERIAL=") and t != "ANDROID_SERIAL="]
+    if k is None:
+        return [], vals(toks), False
+    prog = toks[k]
+    if prog in ("export", "declare", "local", "typeset", "readonly"):
+        return [], vals(toks[:k]) + vals(toks[k + 1:]), False
+    return vals(toks[:k]), [], prog == "unset" and "ANDROID_SERIAL" in toks[k + 1:]
 
 
 class Use:
@@ -398,7 +411,43 @@ class Use:
         self.global_op = self.global_op or other.global_op
 
 
+def parse_scrcpy(toks, i, use, env_serials):
+    """scrcpy has no subcommand, and many of its options take a value: scan every argument."""
+    args, serial, j = toks[i + 1:], None, 0
+    if any(a in SCRCPY_FREE for a in args):
+        return
+    while j < len(args):
+        a = args[j]
+        if a in ("-s", "--serial") and j + 1 < len(args):
+            serial, j = args[j + 1], j + 1
+        elif a.startswith("--serial="):
+            serial = a.split("=", 1)[1]
+        elif a.startswith("--tcpip=") and len(a) > len("--tcpip=+"):
+            serial = a.split("=", 1)[1].lstrip("+")
+        elif a.startswith("-s") and len(a) > 2 and not a.startswith("--"):
+            serial = a[2:]
+        elif a in ("-d", "-e", "--select-usb", "--select-tcpip"):
+            use.problems.append(f"`scrcpy {a}` picks a device that devlock cannot see. Use `scrcpy -s <serial>`.")
+            return
+        j += 1
+    add_targets("scrcpy", [serial] if serial else sorted(env_serials), use)
+
+
+def add_targets(tool, targets, use):
+    if not targets:
+        use.problems.append(f"Name the device: `{tool} -s <serial>` or ANDROID_SERIAL=<serial>. "
+                            "Devices are shared between sessions (devlock).")
+        return
+    for t in targets:
+        if not literal(t):
+            use.problems.append(f"`{tool} -s {t}`: devlock needs the device spelled out, not a variable.")
+        else:
+            use.devices.add(canon(t))
+
+
 def parse_tool(toks, i, tool, use, env_serials):
+    if tool == "scrcpy":
+        return parse_scrcpy(toks, i, use, env_serials)
     j, serial = i + 1, None
     while j < len(toks):
         a = toks[j]
@@ -419,31 +468,53 @@ def parse_tool(toks, i, tool, use, env_serials):
             break
     sub = toks[j] if j < len(toks) else None
     args = toks[j + 1:]
-    if tool != "scrcpy":
-        if sub is None or sub in (ADB_FREE if tool == "adb" else FASTBOOT_FREE):
-            return
-        if tool == "adb" and sub == "kill-server":
-            use.global_op = "adb kill-server"
-            return
-        if tool == "adb" and sub == "disconnect":
-            if not args:
-                use.global_op = "adb disconnect (all devices)"
-            else:
-                use.devices |= {canon(a) for a in args if literal(a)}
-            return
-        if tool == "adb" and sub == "reconnect" and serial is None and not env_serials:
-            use.global_op = "adb reconnect (all devices)"
-            return
-    targets = [serial] if serial else sorted(env_serials)
-    if not targets:
-        use.problems.append(f"Name the device: `{tool} -s <serial>` or ANDROID_SERIAL=<serial>. "
-                            "Devices are shared between sessions (devlock).")
+    if sub is None or sub in (ADB_FREE if tool == "adb" else FASTBOOT_FREE):
         return
-    for t in targets:
-        if not literal(t):
-            use.problems.append(f"`{tool} -s {t}`: devlock needs the device spelled out, not a variable.")
+    if tool == "adb" and sub == "kill-server":
+        use.global_op = "adb kill-server"
+        return
+    if tool == "adb" and sub == "disconnect":
+        if not args:
+            use.global_op = "adb disconnect (all devices)"
         else:
-            use.devices.add(canon(t))
+            use.devices |= {canon(a) for a in args if literal(a)}
+        return
+    if tool == "adb" and sub == "reconnect" and serial is None and not env_serials:
+        use.global_op = "adb reconnect (all devices)"
+        return
+    add_targets(tool, [serial] if serial else sorted(env_serials), use)
+
+
+def shell_command_arg(args):
+    """The command string of `bash -c CMD` / `bash -lc CMD` / `sh -ec CMD`, or None."""
+    has_c, j = False, 0
+    while j < len(args):
+        a = args[j]
+        if a == "--":
+            j += 1
+            break
+        if a in SHELL_OPTS_WITH_ARG:
+            j += 2
+            continue
+        if re.match(r"^[-+][A-Za-z]+$", a):
+            has_c = has_c or (a[0] == "-" and "c" in a)
+        elif not a.startswith("--"):
+            break
+        j += 1
+    return args[j] if has_c and j < len(args) else None
+
+
+def gradle_device_tasks(args):
+    out, j = [], 0
+    while j < len(args):
+        a = args[j]
+        if a in GRADLE_OPTS_WITH_ARG:
+            j += 2
+            continue
+        if not a.startswith("-") and GRADLE_DEVICE_TASK.search(a.rsplit(":", 1)[-1]):
+            out.append(a)
+        j += 1
+    return out
 
 
 def visit(toks, k, chunk, use, env_serials, depth):
@@ -452,10 +523,15 @@ def visit(toks, k, chunk, use, env_serials, depth):
     rest = toks[k + 1:]
     if prog in DEVICE_TOOLS:
         parse_tool(toks, k, prog, use, env_serials)
-    elif prog in SHELLS and "-c" in rest:
-        ci = rest.index("-c")
-        if ci + 1 < len(rest) and depth < 4:
-            use.merge(analyze(rest[ci + 1], depth + 1, env_serials))
+    elif prog in SHELLS and shell_command_arg(rest) is not None:
+        if depth < 4:
+            use.merge(analyze(shell_command_arg(rest), depth + 1, env_serials))
+    elif prog in GRADLE and gradle_device_tasks(rest):
+        if env_serials:
+            add_targets(prog, [x for s in sorted(env_serials) for x in s.split(",") if x], use)
+        else:
+            use.problems.append(f"`{prog} {gradle_device_tasks(rest)[0]}` runs on every connected device: "
+                                f"name one with `ANDROID_SERIAL=<serial> {toks[k]} ...`.")
     elif prog == "find":
         for x, t in enumerate(toks):
             if t in ("-exec", "-execdir", "-ok", "-okdir"):
@@ -476,15 +552,21 @@ def visit(toks, k, chunk, use, env_serials, depth):
 def analyze(cmd, depth=0, inherited_env=()):
     use = Use()
     chunks = [(c, tokens(c.text)) for c in split_commands(strip_heredocs(cmd))]
-    env_serials = set(inherited_env)
-    for _, toks in chunks:
-        k = command_start(toks)
-        for v in env_assignments(toks, len(toks) if k is None else k):
+    session_env = set(inherited_env)
+    chunk_env = {}
+    for c, toks in chunks:
+        own, lasting, unset = env_assignments(toks, command_start(toks))
+        for v in own + lasting:
             if not literal(v):
                 use.problems.append("ANDROID_SERIAL must be a literal serial for devlock, not a variable.")
             else:
-                env_serials.add(v)
-    use.devices |= {canon(s) for s in env_serials - set(inherited_env)}
+                use.devices.add(canon(v))
+        own, lasting = [v for v in own if literal(v)], [v for v in lasting if literal(v)]
+        chunk_env[c.gid] = {own[-1]} if own else set(session_env)
+        if lasting:
+            session_env = {lasting[-1]}
+        elif unset:
+            session_env = set()
 
     parent = {c.gid: c.parent for c, _ in chunks}
     run_gids = set()
@@ -512,7 +594,7 @@ def analyze(cmd, depth=0, inherited_env=()):
                 check_run(rest, use, depth)
             continue
         part = Use()
-        visit(toks, k, c.text, part, env_serials, depth)
+        visit(toks, k, c.text, part, chunk_env[c.gid], depth)
         use.merge(part, bg=c.bg)
     return use
 

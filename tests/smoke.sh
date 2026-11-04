@@ -81,6 +81,63 @@ allow A 'python3 fake-ota/run.py push build.zip --device SER2'
 allow A 'python3 fake-ota/run.py plan https://x'
 reset
 
+# --- shell -c with combined flags
+deny  A "bash -lc 'adb shell reboot'"
+deny  A "sh -ec 'adb shell reboot'"
+deny  A "bash -o pipefail -xc 'adb shell reboot'"
+deny  A "sudo bash --login -c 'adb shell reboot'"
+allow A "bash -lc 'adb -s SER1 shell true'"
+hook pre A 'adb -s SER1 shell true' >/dev/null
+deny  B "bash -lc 'adb -s tva reboot'"
+allow B "bash -lc 'echo hi'"
+reset
+
+# --- gradle device tasks
+deny  A './gradlew connectedAndroidTest'
+deny  A './gradlew :app:connectedDebugAndroidTest --info'
+deny  A 'gradle -p app installDebug'
+deny  A './gradlew uninstallAll'
+allow A './gradlew assembleDebug test lint'
+allow A './gradlew -x installDebug assembleDebug'
+allow A './gradlew installDist :cli:installShadowDist'
+allow A 'ANDROID_SERIAL=SER1 ./gradlew connectedAndroidTest'
+allow A 'export ANDROID_SERIAL=SER2; ./gradlew :app:installDebug'
+deny  B 'ANDROID_SERIAL=tva ./gradlew connectedAndroidTest'
+allow A "$DL run SER1 -- ./gradlew connectedAndroidTest"
+deny  A "$DL run SER1,SER2 -- ./gradlew connectedAndroidTest"
+reset
+
+# --- ANDROID_SERIAL scope
+deny  A 'ANDROID_SERIAL=SER1 true; adb shell reboot'
+deny  A 'env ANDROID_SERIAL=SER1 true && adb shell reboot'
+deny  A 'adb shell reboot; export ANDROID_SERIAL=SER1'
+deny  A 'export ANDROID_SERIAL=SER1; unset ANDROID_SERIAL; adb shell reboot'
+allow A 'export ANDROID_SERIAL=SER1; adb shell true; adb shell true'
+allow A 'ANDROID_SERIAL=SER1; adb shell true'
+allow A 'ANDROID_SERIAL=SER1 adb shell true; ANDROID_SERIAL=SER2 adb shell true'
+allow A 'ANDROID_SERIAL= adb devices'
+stop A; hook pre B 'adb -s SER2 shell true' >/dev/null
+deny  A 'export ANDROID_SERIAL=SER1; ANDROID_SERIAL=SER2 adb shell true'
+deny  A 'export ANDROID_SERIAL=SER2; ANDROID_SERIAL=SER1 adb shell true'
+deny  A 'export ANDROID_SERIAL=SER1; bash -c "adb -s SER2 shell true"'
+reset
+
+# --- scrcpy option values
+allow A 'scrcpy -b 8M -s tva'
+allow A 'scrcpy --max-size 1024 --serial=SER1 -t'
+allow A 'scrcpy -m1024 -sSER2'
+allow A 'scrcpy --tcpip=+10.0.0.35:5555'
+allow A 'scrcpy --version'
+allow A 'ANDROID_SERIAL=SER1 scrcpy -b 8M'
+deny  A 'scrcpy -b 8M'
+deny  A 'scrcpy -t'
+deny  A 'scrcpy -d'
+deny  A 'scrcpy --select-tcpip -b 8M'
+hook pre A 'scrcpy -b 8M -s tva' >/dev/null
+deny  B 'scrcpy -b 8M -s 10.0.0.2:5555'
+deny  B 'scrcpy --tcpip=10.0.0.2:5555'
+reset
+
 # --- background work must go through devlock run
 deny  A 'adb -s SER1 logcat' '{"run_in_background": true}'
 deny  A 'adb -s SER1 logcat | grep x' '{}' Monitor
