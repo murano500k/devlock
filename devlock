@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+"""devlock - one Claude Code session per test device at a time.
+
+  devlock run [--timeout SEC] DEVICE[,DEVICE...] -- COMMAND...
+                     wait for the devices, run COMMAND holding them, release on exit
+                     (a single COMMAND argument runs through bash -c)
+  devlock wait [--timeout SEC] DEVICE[,DEVICE...]
+                     block until no other session holds the devices
+  devlock status     who holds which device
+  devlock release [DEVICE]
+                     drop this session's short-work leases (all devices without DEVICE)
+  devlock hook pre|post|stop
+                     Claude Code hooks (JSON on stdin)
+
+State: $DEVLOCK_DIR (default ~/.local/state/devlock). Device names: devices.conf there.
+"""
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+STATE = os.environ.get("DEVLOCK_DIR") or os.path.expanduser("~/.local/state/devlock")
+CONF = os.environ.get("DEVLOCK_CONF") or os.path.join(STATE, "devices.conf")
+LEASE_SEC = int(os.environ.get("DEVLOCK_LEASE_SEC", "300"))
+LEASE_MARGIN = 60
+BASH_DEFAULT_TIMEOUT_MS = 120000
+RUN_DEFAULT_TIMEOUT = 1800
+SELF = os.path.abspath(__file__)
+
+ADB_FREE = {"devices", "version", "help", "start-server", "connect", "keygen", "mdns", "pair",
+            "host-features", "--version", "--help"}
+FASTBOOT_FREE = {"devices", "--version", "--help", "help"}
+TOOL_OPTS_WITH_ARG = {"-H", "-P", "-L", "-i", "-p", "-c", "-S", "--slot", "--os-version", "--header-version"}
+DEVICE_TOOLS = {"adb", "fastboot", "scrcpy"}
+KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "[[", "time"}
+# wrapper -> its options that take a separate argument
+WRAPPERS = {
+    "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "nohup": set(), "setsid": set(), "command": set(), "builtin": set(),
+    "exec": {"-a"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "watch": {"-n", "--interval", "-d"},
+    "xargs": {"-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "--max-args", "--max-procs"},
+    "chrt": {"-p"}, "taskset": {"-p"}, "unbuffer": set(), "script": {"-c"},
+}
+INTERPRETERS = {"python", "python3", "node", "uv", "perl", "ruby"}
+SHELLS = {"bash", "sh", "zsh"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+ALIASES, SCRIPTS = {}, []
+
+
+def session_id():
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or f"shell-{os.getppid()}"
+
+
+def load_conf():
+    """Device names and script patterns. A broken line is skipped (and logged), never fatal."""
+    if os.path.islink(CONF) and not os.path.exists(CONF):
+        log(f"WARN devices.conf is a broken link ({os.readlink(CONF)}): every name is its own device")
+    try:
+        with open(CONF) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("script "):
+            try:
+                SCRIPTS.append(re.compile(line.split(None, 1)[1].strip()))
+            except re.error as e:
+                log(f"WARN devices.conf: bad script pattern {line!r}: {e}")
+            continue
+        names = line.split("#", 1)[0].split()
+        for n in names:
+            ALIASES[n] = names[0]
+
+
+def canon(name):
+    return ALIASES.get(name, name)
+
+
+def fname(serial):
+    return re.sub(r"[^A-Za-z0-9._:-]", "_", serial)
+
+
+def path(serial, ext):
+    return os.path.join(STATE, f"{fname(serial)}.{ext}")
+
+
+def read_json(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(p, obj):
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        if obj is not None:
+            json.dump(obj, f)
+    os.replace(tmp, p)
+
+
+def log(line):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        p = os.path.join(STATE, "hook.log")
+        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+            os.replace(p, p + ".1")
+        with open(p, "a") as f:
+            f.write(f"{time.strftime('%F %T')} {line}\n")
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def mutex(timeout=5.0):
+    os.makedirs(STATE, exist_ok=True)
+    fd = os.open(os.path.join(STATE, ".mutex"), os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.time() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    raise TimeoutError("devlock state is locked by a stuck process")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------- holders: runs and leases
+
+def proc_start(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError, TypeError):
+        return None
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def alive(entry):
+    """A run holds its devices while devlock or anything in its command's process group lives,
+    so kill -9 frees the device and a grandchild of a killed run still holds it."""
+    if any(st and proc_start(p) == st for p, st in entry.get("procs", [])):
+        return True
+    return bool(entry.get("pgid")) and group_alive(entry["pgid"])
+
+
+def runs(serial):
+    return [e for e in (read_json(path(serial, "runs")) or []) if alive(e)]
+
+
+def lease(serial, now=None):
+    data = read_json(path(serial, "lease"))
+    if data and data.get("until", 0) > (now or time.time()):
+        return data
+    return None
+
+
+def describe(e):
+    return f"session={e.get('session')} pid={e.get('pid')} since={e.get('since')} cmd={e.get('cmd')}"
+
+
+def blockers(serials, sess, now=None):
+    out = []
+    for s in serials:
+        for e in runs(s):
+            if e.get("session") != sess:
+                out.append(f"{s}: another session's run holds it ({describe(e)})")
+        l = lease(s, now)
+        if l and l.get("session") != sess:
+            out.append(f"{s}: in use by session {l['session']} until "
+                       f"{time.strftime('%H:%M:%S', time.localtime(l['until']))} at the latest")
+    return out
+
+
+def known_serials():
+    if not os.path.isdir(STATE):
+        return []
+    return sorted({f.rsplit(".", 1)[0] for f in os.listdir(STATE) if f.endswith((".runs", ".lease"))})
+
+
+def release_leases(sess, only=None, keep_inflight=False):
+    now = time.time()
+    for s in known_serials():
+        if only and s != fname(canon(only)):
+            continue
+        l = lease(s, now)
+        if not l or l.get("session") != sess:
+            continue
+        if keep_inflight and any(d > now for d in (l.get("inflight") or {}).values()):
+            continue
+        write_json(path(s, "lease"), None)
+
+
+# ---------------------------------------------------------------- command analysis
+
+class Chunk:
+    def __init__(self, gid, parent):
+        self.buf, self.bg, self.gid, self.parent = [], False, gid, parent
+
+    @property
+    def text(self):
+        return "".join(self.buf).strip()
+
+
+def split_commands(cmd):
+    """Split a shell command into simple commands: on unquoted ; & | && || newline ( ), and into
+    $( ) / backtick substitutions, which run even inside double quotes. A substitution's chunks
+    carry the gid of the command they sit in as parent. bg marks a command ended by a single &."""
+    out, ids = [], iter(range(1 << 30))
+    cur = Chunk(next(ids), None)
+    stack = []  # '"' or ('(' | '`', enclosing chunk)
+
+    def emit(bg=False):
+        nonlocal cur
+        if cur.text:
+            cur.bg = bg
+            out.append(cur)
+        elif bg and out:
+            out[-1].bg = True
+        cur = Chunk(next(ids), cur.parent)
+
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        top = stack[-1] if stack and stack[-1] == '"' else (stack[-1][0] if stack else None)
+        if c == "\\" and i + 1 < n:
+            cur.buf.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c == "'" and top != '"':
+            j = cmd.find("'", i + 1)
+            j = n - 1 if j < 0 else j
+            cur.buf.append(cmd[i:j + 1])
+            i = j + 1
+            continue
+        if c == "$" and cmd[i + 1:i + 2] == "(" and cmd[i + 2:i + 3] != "(":
+            stack.append(("(", cur))
+            cur = Chunk(next(ids), cur.gid)
+            i += 2
+            continue
+        if c == "`":
+            if top == "`":
+                emit()
+                cur = stack.pop()[1]
+            else:
+                stack.append(("`", cur))
+                cur = Chunk(next(ids), cur.gid)
+            i += 1
+            continue
+        if top == '"':
+            if c == '"':
+                stack.pop()
+            cur.buf.append(c)
+            i += 1
+            continue
+        if c == '"':
+            stack.append('"')
+            cur.buf.append(c)
+            i += 1
+            continue
+        if c == ")" and top == "(":
+            emit()
+            cur = stack.pop()[1]
+            i += 1
+            continue
+        if c == "&":
+            prev, nxt = cmd[i - 1:i], cmd[i + 1:i + 2]
+            if prev in ("<", ">", "|") or nxt == ">":
+                cur.buf.append(c)
+                i += 1
+            elif nxt == "&":
+                emit()
+                i += 2
+            else:
+                emit(bg=True)
+                i += 1
+            continue
+        if c in ";|\n()":
+            emit()
+            i += 1
+            continue
+        cur.buf.append(c)
+        i += 1
+    emit()
+    while stack:
+        item = stack.pop()
+        if item != '"':
+            cur = item[1]
+            emit()
+    return out
+
+
+def strip_heredocs(cmd):
+    """Drop here-document bodies: they are data, not commands."""
+    out, lines, i = [], cmd.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for tabs, word in re.findall(r"(?<![<\"'])<<(?!<)(-?)\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line):
+            while i < len(lines) and (lines[i].lstrip("\t") if tabs else lines[i]) != word:
+                i += 1
+            i += 1
+    return "\n".join(out)
+
+
+def tokens(chunk):
+    try:
+        return shlex.split(chunk, comments=True)
+    except ValueError:
+        return chunk.split()
+
+
+def command_start(toks, i=0):
+    """Index of the program word, skipping assignments, keywords and wrappers with their options."""
+    while i < len(toks):
+        t = toks[i]
+        b = os.path.basename(t)
+        if ASSIGN.match(t) or t in KEYWORDS:
+            i += 1
+        elif b in WRAPPERS:
+            i += 1
+            while i < len(toks) and toks[i].startswith("-") and toks[i] not in ("-", "--"):
+                i += 2 if toks[i] in WRAPPERS[b] else 1
+            if i < len(toks) and toks[i] == "--":
+                i += 1
+            if b == "timeout":
+                i += 1
+            while b == "env" and i < len(toks) and ASSIGN.match(toks[i]):
+                i += 1
+        else:
+            return i
+    return None
+
+
+def mentioned(text):
+    found = set()
+    for name, serial in ALIASES.items():
+        if re.search(r"(?<![A-Za-z0-9._:/-])" + re.escape(name) + r"(?![A-Za-z0-9_:/-]|\.[A-Za-z0-9])", text):
+            found.add(serial)
+    return found
+
+
+def literal(v):
+    return bool(v) and not re.search(r"[$`*?]", v)
+
+
+def env_assignments(toks, k):
+    """ANDROID_SERIAL values set by this simple command (prefix assignments, env, export)."""
+    vals = [t.split("=", 1)[1] for t in toks[:k] if t.startswith("ANDROID_SERIAL=")]
+    if k < len(toks) and toks[k] in ("export", "declare", "local", "typeset"):
+        vals += [t.split("=", 1)[1] for t in toks[k + 1:] if t.startswith("ANDROID_SERIAL=")]
+    return [v for v in vals if v]
+
+
+class Use:
+    def __init__(self):
+        self.devices = set()
+        self.bg_devices = set()
+        self.problems = []
+        self.global_op = None
+
+    def merge(self, other, bg=False):
+        self.devices |= other.devices
+        self.bg_devices |= other.bg_devices | (other.devices if bg else set())
+        self.problems += other.problems
+        self.global_op = self.global_op or other.global_op
+
+
+def parse_tool(toks, i, tool, use, env_serials):
+    j, serial = i + 1, None
+    while j < len(toks):
+        a = toks[j]
+        if a in ("-s", "--serial") and j + 1 < len(toks):
+            serial, j = toks[j + 1], j + 2
+        elif a.startswith("--serial="):
+            serial, j = a.split("=", 1)[1], j + 1
+        elif a.startswith("-s") and len(a) > 2 and tool != "fastboot":
+            serial, j = a[2:], j + 1
+        elif a in ("-d", "-e", "-t") or a.startswith(("--transport-id", "--select-usb", "--select-tcpip", "-t")):
+            use.problems.append(f"`{tool} {a}` picks a device that devlock cannot see. Use `{tool} -s <serial>`.")
+            return
+        elif a in TOOL_OPTS_WITH_ARG:
+            j += 2
+        elif a.startswith("-") and a not in ("--version", "--help"):
+            j += 1
+        else:
+            break
+    sub = toks[j] if j < len(toks) else None
+    args = toks[j + 1:]
+    if tool != "scrcpy":
+        if sub is None or sub in (ADB_FREE if tool == "adb" else FASTBOOT_FREE):
+            return
+        if tool == "adb" and sub == "kill-server":
+            use.global_op = "adb kill-server"
+            return
+        if tool == "adb" and sub == "disconnect":
+            if not args:
+                use.global_op = "adb disconnect (all devices)"
+            else:
+                use.devices |= {canon(a) for a in args if literal(a)}
+            return
+        if tool == "adb" and sub == "reconnect" and serial is None and not env_serials:
+            use.global_op = "adb reconnect (all devices)"
+            return
+    targets = [serial] if serial else sorted(env_serials)
+    if not targets:
+        use.problems.append(f"Name the device: `{tool} -s <serial>` or ANDROID_SERIAL=<serial>. "
+                            "Devices are shared between sessions (devlock).")
+        return
+    for t in targets:
+        if not literal(t):
+            use.problems.append(f"`{tool} -s {t}`: devlock needs the device spelled out, not a variable.")
+        else:
+            use.devices.add(canon(t))
+
+
+def visit(toks, k, chunk, use, env_serials, depth):
+    """Analyze the simple command whose program word is toks[k]."""
+    prog = os.path.basename(toks[k])
+    rest = toks[k + 1:]
+    if prog in DEVICE_TOOLS:
+        parse_tool(toks, k, prog, use, env_serials)
+    elif prog in SHELLS and "-c" in rest:
+        ci = rest.index("-c")
+        if ci + 1 < len(rest) and depth < 4:
+            use.merge(analyze(rest[ci + 1], depth + 1, env_serials))
+    elif prog == "find":
+        for x, t in enumerate(toks):
+            if t in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = next((y for y in range(x + 1, len(toks)) if toks[y] in (";", "+")), len(toks))
+                sub = toks[x + 1:end]
+                kk = command_start(sub)
+                if kk is not None:
+                    visit(sub, kk, " ".join(sub), use, env_serials, depth)
+    elif (prog.endswith((".sh", ".py")) or "/" in toks[k] or prog in INTERPRETERS
+          or (prog in SHELLS and rest) or prog in ("gradlew", "make", "pytest")):
+        named = mentioned(chunk) | {canon(s) for s in env_serials}
+        use.devices |= named
+        if not named and any(p.search(chunk) for p in SCRIPTS):
+            use.problems.append("This script picks a test device on its own: pass the device explicitly "
+                                "(--device <serial or address>) so devlock can lock it.")
+
+
+def analyze(cmd, depth=0, inherited_env=()):
+    use = Use()
+    chunks = [(c, tokens(c.text)) for c in split_commands(strip_heredocs(cmd))]
+    env_serials = set(inherited_env)
+    for _, toks in chunks:
+        k = command_start(toks)
+        for v in env_assignments(toks, len(toks) if k is None else k):
+            if not literal(v):
+                use.problems.append("ANDROID_SERIAL must be a literal serial for devlock, not a variable.")
+            else:
+                env_serials.add(v)
+    use.devices |= {canon(s) for s in env_serials - set(inherited_env)}
+
+    parent = {c.gid: c.parent for c, _ in chunks}
+    run_gids = set()
+    for c, toks in chunks:
+        k = command_start(toks)
+        if k is not None and os.path.basename(toks[k]) == "devlock" and toks[k + 1:k + 2] == ["run"]:
+            run_gids.add(c.gid)
+
+    def inside_run(gid):
+        seen = set()
+        while gid is not None and gid not in seen:
+            seen.add(gid)
+            gid = parent.get(gid)
+            if gid in run_gids:
+                return True
+        return False
+
+    for c, toks in chunks:
+        k = command_start(toks)
+        if k is None or inside_run(c.gid):
+            continue
+        rest = toks[k + 1:]
+        if os.path.basename(toks[k]) == "devlock":
+            if rest[:1] == ["run"]:
+                check_run(rest, use, depth)
+            continue
+        part = Use()
+        visit(toks, k, c.text, part, env_serials, depth)
+        use.merge(part, bg=c.bg)
+    return use
+
+
+def check_run(rest, use, depth):
+    if "--" not in rest:
+        return
+    held = set()
+    args = rest[1:rest.index("--")]
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a == "--timeout":
+            skip = True
+        else:
+            held |= {canon(x) for x in a.split(",") if x}
+    inner = rest[rest.index("--") + 1:]
+    inner_cmd = inner[0] if len(inner) == 1 else shlex.join(inner)
+    iu = analyze(inner_cmd, depth + 1) if depth < 4 else Use()
+    extra = iu.devices - held
+    if extra:
+        use.problems.append(f"The run also uses {', '.join(sorted(extra))}: list every device "
+                            "it touches, e.g. devlock run A,B -- ...")
+    if len(held) > 1 and iu.problems:
+        use.problems.append("A run over several devices sets no ANDROID_SERIAL: name the device "
+                            "in every adb/fastboot call inside it.")
+    if iu.global_op:
+        use.problems.append(f"`{iu.global_op}` affects every device; do not run it inside a run.")
+
+
+# ---------------------------------------------------------------- hooks
+
+def deny(sess, cmd, reason):
+    log(f"DENY {sess} {cmd!r}: {reason}")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+    return 0
+
+
+def tool_timeout(ti):
+    try:
+        return float(ti.get("timeout") or BASH_DEFAULT_TIMEOUT_MS) / 1000
+    except (TypeError, ValueError):
+        return BASH_DEFAULT_TIMEOUT_MS / 1000
+
+
+def hook(mode):
+    try:
+        data = json.loads(sys.stdin.read())
+    except ValueError:
+        return 0
+    if not isinstance(data, dict) or not data.get("session_id"):
+        return 0
+    sess = data["session_id"]
+    if mode == "stop":
+        with mutex():
+            # Leases of commands still running (e.g. in a background subagent) outlive the turn.
+            release_leases(sess, keep_inflight=True)
+        return 0
+    tool = data.get("tool_name", "Bash")
+    ti = data.get("tool_input") or {}
+    cmd = ti.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return 0
+    use = analyze(cmd)
+    if not use.devices and not use.global_op and not use.problems:
+        return 0
+    now = time.time()
+    call = str(data.get("tool_use_id") or "")
+    if mode == "post":
+        with mutex():
+            for s in use.devices:
+                l = lease(s, now)
+                if l and l.get("session") != sess:
+                    continue
+                l = l or {"session": sess, "until": 0}
+                inflight = {k: v for k, v in (l.get("inflight") or {}).items() if k != call and v > now}
+                write_json(path(s, "lease"), {"session": sess, "until": max(l["until"], now + LEASE_SEC),
+                                              "inflight": inflight})
+        return 0
+
+    if use.problems:
+        return deny(sess, cmd, use.problems[0])
+    background = tool == "Monitor" or bool(ti.get("run_in_background"))
+    bg = use.devices if background else use.bg_devices
+    if bg:
+        return deny(sess, cmd, "Background work on a shared device must hold it for its whole life: run it as "
+                    f"`{SELF} run {','.join(sorted(bg))} -- <command>` (with the Bash tool's run_in_background, "
+                    "not a trailing &).")
+    try:
+        with mutex():
+            if use.global_op:
+                busy = blockers(known_serials(), sess, now)
+                if busy:
+                    return deny(sess, cmd, f"`{use.global_op}` would cut off other sessions' devices "
+                                f"({'; '.join(busy)}). Do not run it while they are in use.")
+            busy = blockers(sorted(use.devices), sess, now)
+            if busy:
+                return deny(sess, cmd, f"Device busy - {'; '.join(busy)}. Do not work around this (other "
+                            f"spellings, deleting lock files). Queue with `{SELF} run <device> -- <command>` "
+                            "in the background, or use another device.")
+            deadline = now + max(LEASE_SEC, tool_timeout(ti) + LEASE_MARGIN)
+            for s in use.devices:
+                l = lease(s, now) or {"until": 0}
+                inflight = {k: v for k, v in (l.get("inflight") or {}).items() if v > now}
+                if call:
+                    inflight[call] = deadline
+                write_json(path(s, "lease"), {"session": sess, "until": max(l["until"], deadline),
+                                              "inflight": inflight})
+    except TimeoutError as e:
+        return deny(sess, cmd, f"devlock: {e}; retry in a moment.")
+    log(f"ALLOW {sess} {sorted(use.devices)} {cmd!r}")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def parse_devices_timeout(argv, default_timeout):
+    timeout, names, i = default_timeout, [], 0
+    while i < len(argv) and argv[i] != "--":
+        if argv[i] == "--timeout" and i + 1 < len(argv):
+            timeout, i = float(argv[i + 1]), i + 2
+            continue
+        names += [x for x in argv[i].split(",") if x]
+        i += 1
+    if not names:
+        sys.exit("devlock: name at least one device")
+    return timeout, names, argv[i + 1:]
+
+
+def acquire(serials, sess, timeout, entry=None):
+    """Wait until no other session holds the devices; with entry, register it as a run on them."""
+    deadline = time.time() + timeout if timeout else None
+    announced = False
+    while True:
+        with mutex(30):
+            busy = blockers(serials, sess)
+            if not busy:
+                if entry:
+                    for s in serials:
+                        write_json(path(s, "runs"), runs(s) + [entry])
+                return
+        if not announced:
+            print(f"[devlock] busy: {'; '.join(busy)}; queued", file=sys.stderr, flush=True)
+            announced = True
+        if deadline and time.time() > deadline:
+            print(f"[devlock] gave up after {timeout:.0f}s waiting for {', '.join(serials)}", file=sys.stderr)
+            sys.exit(75)
+        time.sleep(1)
+
+
+def update_run(serials, pid, entry=None):
+    with mutex(30):
+        for s in serials:
+            others = [e for e in runs(s) if e.get("pid") != pid]
+            write_json(path(s, "runs"), others + ([entry] if entry else []))
+
+
+def adb_name(name):
+    """The name adb knows the device by right now (a nickname is not one)."""
+    serial = canon(name)
+    names = [name, serial] + sorted((a for a, s in ALIASES.items() if s == serial and ":" in a), key=len, reverse=True)
+    try:
+        out = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10).stdout
+        connected = {l.split()[0] for l in out.splitlines()[1:] if l.strip()}
+    except (OSError, subprocess.SubprocessError):
+        connected = set()
+    return next((n for n in names if n in connected), name if name == serial or ":" in name else serial)
+
+
+def cmd_run(argv):
+    timeout, names, command = parse_devices_timeout(argv, RUN_DEFAULT_TIMEOUT)
+    if not command:
+        sys.exit("devlock run: missing -- COMMAND")
+    serials = sorted({canon(n) for n in names})
+    me = os.getpid()
+    entry = {"session": session_id(), "pid": me, "since": time.strftime("%T"),
+             "cmd": " ".join(command)[:200], "procs": [[me, proc_start(me)]]}
+    child, pending = None, []
+
+    def forward(sig, _):
+        if child is None:
+            pending.append(sig)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, sig)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, forward)
+    acquire(serials, entry["session"], timeout, entry)
+    try:
+        if pending:
+            return 128 + pending[0]
+        print(f"[devlock] holding {', '.join(serials)}", file=sys.stderr, flush=True)
+        env = dict(os.environ, DEVLOCK_HELD=",".join(serials))
+        if len(serials) == 1:
+            env["ANDROID_SERIAL"] = adb_name(names[0])
+        argv = ["bash", "-c", command[0]] if len(command) == 1 else command
+        try:
+            child = subprocess.Popen(argv, env=env, start_new_session=True)
+        except OSError as e:
+            print(f"[devlock] {e}", file=sys.stderr)
+            return 127
+        entry["pgid"] = child.pid
+        update_run(serials, me, entry)
+        if pending:
+            forward(pending[0], None)
+        rc = child.wait()
+        return 128 - rc if rc < 0 else rc
+    finally:
+        # The command's process group may outlive bash -c; keep holding until it is gone.
+        if child is not None:
+            while group_alive(child.pid):
+                time.sleep(0.5)
+        update_run(serials, me)
+
+
+def cmd_wait(argv):
+    timeout, names, _ = parse_devices_timeout(argv, 0)
+    acquire(sorted({canon(n) for n in names}), session_id(), timeout)
+    return 0
+
+
+def cmd_status():
+    sess = session_id()
+    shown = False
+    for s in known_serials():
+        for e in runs(s):
+            print(f"{s}  run: {describe(e)}{'  (this session)' if e.get('session') == sess else ''}")
+            shown = True
+        l = lease(s)
+        if l:
+            print(f"{s}  lease: session={l['session']} until {time.strftime('%T', time.localtime(l['until']))}"
+                  f"{'  (this session)' if l['session'] == sess else ''}")
+            shown = True
+    if not shown:
+        print("all devices free")
+    print(f"(this session: {sess})")
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["hook"]:
+        try:
+            load_conf()
+            return hook(a[1] if len(a) > 1 else "pre")
+        except Exception as e:  # never block every Bash call on a devlock bug
+            log(f"ERROR hook {a[1:]}: {e!r}")
+            return 0
+    load_conf()
+    if a[:1] == ["run"]:
+        return cmd_run(a[1:])
+    if a[:1] == ["wait"]:
+        return cmd_wait(a[1:])
+    if a[:1] == ["status"]:
+        return cmd_status()
+    if a[:1] == ["release"]:
+        with mutex():
+            release_leases(session_id(), a[1] if len(a) > 1 else None)
+        return 0
+    print(__doc__.strip())
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
