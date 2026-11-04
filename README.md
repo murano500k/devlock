@@ -60,6 +60,12 @@ forever, exit 75 on timeout). `SKILL.md` is what the agent reads.
 State and the decision log live in `$DEVLOCK_DIR` (default `~/.local/state/devlock`, log in
 `hook.log`).
 
+## Documentation
+
+- [docs/guide.md](docs/guide.md) - setup, devices.conf, daily use, troubleshooting
+- [docs/reference.md](docs/reference.md) - every command, hook rule, setting and file
+- [docs/internals.md](docs/internals.md) - how it works, failure modes, known limits
+
 ## Tests
 
 - `tests/smoke.sh` - hook and run semantics on fake devices, no adb needed.
