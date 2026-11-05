@@ -564,7 +564,8 @@ hook pre B 'adb -s SER1 shell true' >/dev/null
 o=$(CLAUDE_CODE_SESSION_ID=A doctor); [[ "$o" == *"SER1: in use by another session, not probed"* ]] && ok "doctor skips devices others hold" || bad "doctor skip held" "$o"
 reset
 
-# --- devices.toml
+# --- devices.toml (needs Python 3.11+ or tomli, which the package installs on older Pythons)
+if python3 -c "import tomllib" 2>/dev/null || python3 -c "import tomli" 2>/dev/null; then
 TOML=$DEVLOCK_DIR/t/devices.toml
 mkdir -p "$DEVLOCK_DIR/t"
 cat > "$TOML" <<'TOMLEOF'
@@ -633,6 +634,9 @@ HOME="$I/home" DEVLOCK_DIR="$I/state" "$DL" install --claude --conf "$TOML" >/de
 	&& ok "install: toml link replaces conf link, skill and hooks in place" || bad "install toml" "$(ls -la "$I/state" "$I/home/.claude")"
 o=$(HOME="$I/home" DEVLOCK_DIR="$I/state" "$DL" status); [[ "$o" == "all devices free"* ]] && ok "status reads devices.toml" || bad "status toml" "$o"
 reset
+else
+	echo "skip devices.toml tests: python3 has neither tomllib nor tomli"
+fi
 
 # --- robustness
 o=$(echo 'not json' | "$DL" hook pre); [ -z "$o" ] && ok "bad hook input is ignored" || bad "bad hook input is ignored"
