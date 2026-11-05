@@ -8,8 +8,9 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STATE=${DEVLOCK_DIR:-$HOME/.local/state/devlock}
-SETTINGS=$HOME/.claude/settings.json
-SKILL=$HOME/.claude/skills/devlock
+CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+SETTINGS=$CLAUDE_DIR/settings.json
+SKILL=$CLAUDE_DIR/skills/devlock
 TOOL=$SKILL/devlock
 
 conf=
@@ -42,7 +43,9 @@ elif [ ! -e "$STATE/devices.conf" ]; then
 fi
 
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-new=$(jq --arg c '$HOME/.claude/skills/devlock/devlock hook' '
+hookcmd='$HOME/.claude/skills/devlock/devlock hook'
+[ -n "${CLAUDE_CONFIG_DIR:-}" ] && hookcmd="$TOOL hook"
+new=$(jq --arg c "$hookcmd" '
 	def strip: map(.hooks |= map(select((.command // "") | test("devlock") | not))) | map(select(.hooks | length > 0));
 	def add($ev; $m; $arg): .hooks[$ev] = ((.hooks[$ev] // []) | strip) +
 		[{hooks: [{type: "command", command: "\($c) \($arg)", timeout: 10}]} + (if $m then {matcher: $m} else {} end)];

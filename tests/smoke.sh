@@ -436,6 +436,96 @@ for i in $(seq 20); do
 done
 [ $wins = 20 ] && ok "race: one winner in 20/20" || bad "race: one winner" "$wins/20"
 
+# --- check / whoami / status --json / log
+o=$(CLAUDE_CODE_SESSION_ID=A "$DL" check 'adb -s tva reboot'); rc=$?
+[ $rc = 0 ] && [[ "$o" == *"allow"*SER1* ]] && ok "check: allow names the device" || bad "check: allow" "rc=$rc $o"
+[ ! -s "$DEVLOCK_DIR/SER1.lease" ] && ok "check takes no lease" || bad "check takes no lease"
+hook pre A 'adb -s SER1 shell true' >/dev/null
+o=$(CLAUDE_CODE_SESSION_ID=B "$DL" check adb -s 10.0.0.2:5555 reboot); rc=$?
+[ $rc = 1 ] && [[ "$o" == *"Device busy"* ]] && ok "check: busy device is denied" || bad "check: busy" "rc=$rc $o"
+o=$("$DL" check --session A --json 'adb -s SER1 reboot')
+[ "$(jq -r .verdict <<<"$o")" = allow ] && ok "check --session: own lease is fine" || bad "check --session" "$o"
+o=$("$DL" check --bg --session A 'adb -s SER1 logcat'); [[ "$o" == *"deny: Background"* ]] && ok "check --bg: background needs a run" || bad "check --bg" "$o"
+o=$("$DL" check 'ls -la'); rc=$?
+[ $rc = 0 ] && [[ "$o" == "not a device command"* ]] && ok "check: non-device command" || bad "check: non-device" "$o"
+o=$(CLAUDE_CODE_SESSION_ID=A "$DL" whoami)
+[[ "$o" == *"session: A (Claude Code session)"* && "$o" == *"SER1  lease"* ]] && ok "whoami lists own lease" || bad "whoami" "$o"
+o=$(CLAUDE_CODE_SESSION_ID=B "$DL" whoami)
+[[ "$o" == *"holding nothing"* ]] && ok "whoami: other session holds nothing" || bad "whoami other" "$o"
+o=$(CLAUDE_CODE_SESSION_ID=B "$DL" status --json)
+[ "$(jq -r '.entries[0] | "\(.device) \(.kind) \(.session) \(.inflight)"' <<<"$o")" = "SER1 lease A null" ] \
+	&& ok "status --json" || bad "status --json" "$o"
+o=$(timeout 3 "$DL" status --watch --interval 1)
+[[ "$o" == *"devlock status"*"SER1  lease"* ]] && ok "status --watch redraws" || bad "status --watch" "$o"
+deny B 'adb -s SER1 reboot'
+o=$("$DL" log --denied -n 1)
+[[ "$o" == *DENY*B*SER1*"adb -s SER1 reboot"* && "$o" == *"Device busy"* ]] && ok "log --denied shows the refusal" || bad "log --denied" "$o"
+o=$("$DL" log --json --session A -n 100)
+[ -n "$o" ] && [ -z "$(jq -c 'select(.session != "A")' <<<"$o")" ] && ok "log --session filters" || bad "log --session" "$o"
+o=$("$DL" log --since 1m --denied); [[ "$o" == *DENY* ]] && ok "log --since" || bad "log --since" "$o"
+o=$(CLAUDE_CODE_SESSION_ID=C "$DL" check 'adb -s SER1 reboot' --json); [ $? = 1 ] && [ "$(jq -r .verdict <<<"$o")" = deny ] \
+	&& ok "check: options after the command" || bad "check trailing options" "$o"
+o=$("$DL" check 'adb -s SER1 reboot' --session A); [ $? = 0 ] && ok "check: --session after the command" || bad "check trailing --session" "$o"
+reset
+
+# --- doctor (fake adb: each name and the ro.serialno behind it)
+FAKE=$DEVLOCK_DIR/fakeadb
+mkdir -p "$FAKE/conf"
+cat > "$FAKE/adb" <<'ADB'
+#!/usr/bin/env bash
+map=$(dirname "$0")/map
+if [ "$1" = devices ]; then echo "List of devices attached"; awk '{print $1"\t"($3 ? $3 : "device")}' "$map"; exit 0; fi
+[ "$1" = -s ] && awk -v n="$2" '$1 == n {print $2}' "$map"
+ADB
+chmod +x "$FAKE/adb"
+doctor() { DEVLOCK_ADB="$FAKE/adb" DEVLOCK_CONF="$FAKE/devices.conf" CLAUDE_CONFIG_DIR="$FAKE" "$DL" doctor "$@"; }
+conf0='SER1 10.0.0.2:5555 10.0.0.2 tva  # living room
+SER2 10.0.0.20:5555 tvb
+SERX x1
+10.0.0.9:5555 x2
+script foo\.py'
+printf '%s\n' "$conf0" > "$FAKE/conf/devices.conf"
+ln -s "$FAKE/conf/devices.conf" "$FAKE/devices.conf"
+printf '%s\n' 'SER1 SER1' '10.0.0.2:5555 SER1' '10.0.0.77:5555 SER2' '10.0.0.9:5555 SERX' '10.0.0.90:5555 NEW1' \
+	'10.0.0.91:5555 x unauthorized' > "$FAKE/map"
+o=$(doctor); rc=$?
+[ $rc = 1 ] && [[ "$o" == *"ok    SER1: 10.0.0.2:5555, SER1 share one lock"* ]] && ok "doctor: complete line is ok" || bad "doctor ok line" "$o"
+[[ "$o" == *"SER2: not listed under 10.0.0.77:5555, 10.0.0.77"* ]] && ok "doctor: missing alias" || bad "doctor missing alias" "$o"
+[[ "$o" == *"NEW1: not in devices.conf"* ]] && ok "doctor: unknown device" || bad "doctor unknown" "$o"
+[[ "$o" == *"SERX: split over 2"* ]] && ok "doctor: one device on two lines" || bad "doctor split" "$o"
+[[ "$o" == *"10.0.0.91:5555: unauthorized"* ]] && ok "doctor: unauthorized device warned" || bad "doctor unauthorized" "$o"
+[ "$(cat "$FAKE/conf/devices.conf")" = "$conf0" ] && ok "doctor without --fix writes nothing" || bad "doctor wrote"
+o=$(doctor --fix); rc=$?
+want='SER1 10.0.0.2:5555 10.0.0.2 tva  # living room
+SER2 10.0.0.20:5555 tvb 10.0.0.77:5555 10.0.0.77
+SERX x1 10.0.0.9:5555 x2 10.0.0.9
+script foo\.py
+NEW1 10.0.0.90:5555 10.0.0.90'
+[ $rc = 0 ] && [ "$(cat "$FAKE/conf/devices.conf")" = "$want" ] && ok "doctor --fix merges and adds" || bad "doctor --fix" "rc=$rc $o $(cat "$FAKE/conf/devices.conf")"
+[ -L "$FAKE/devices.conf" ] && ls "$DEVLOCK_DIR"/devices.conf.bak-* >/dev/null 2>&1 && ok "doctor --fix keeps the link, backs up" || bad "doctor link/backup"
+o=$(doctor); [ $? = 0 ] && [[ "$o" != *FIX* ]] && ok "doctor clean after --fix" || bad "doctor after fix" "$o"
+printf '%s\n' 'SER1 10.0.0.2:5555 10.0.0.2 tva' 'SER2 tvb' > "$FAKE/conf/devices.conf"
+printf '%s\n' '10.0.0.2:5555 SER2' > "$FAKE/map"
+o=$(doctor); [ $? = 1 ] && [[ "$o" == *"SER2: 10.0.0.2:5555, 10.0.0.2 now reach this device but are listed on SER1's line"* ]] \
+	&& ok "doctor: address taken over by another device" || bad "doctor takeover" "$o"
+doctor --fix >/dev/null
+[ "$(cat "$FAKE/conf/devices.conf")" = "$(printf '%s\n' 'SER1 tva' 'SER2 tvb 10.0.0.2:5555 10.0.0.2')" ] \
+	&& ok "doctor --fix moves the address, keeps two locks" || bad "doctor --fix takeover" "$(cat "$FAKE/conf/devices.conf")"
+printf '%s\n' 'SER1 SER1' '10.0.0.2:5555 SER2' > "$FAKE/map"
+printf '%s\n' 'SER1 10.0.0.2:5555' > "$FAKE/conf/devices.conf"
+doctor --fix >/dev/null
+[ "$(cat "$FAKE/conf/devices.conf")" = "$(printf '%s\n' 'SER1' 'SER2 10.0.0.2:5555 10.0.0.2')" ] \
+	&& ok "doctor --fix splits two devices off one line" || bad "doctor --fix split devices" "$(cat "$FAKE/conf/devices.conf")"
+: > "$FAKE/conf/devices.conf"
+printf '%s\n' '127.0.0.1:5555 SERA' '127.0.0.1:5556 SERB' > "$FAKE/map"
+doctor --fix >/dev/null
+[ "$(cat "$FAKE/conf/devices.conf")" = "$(printf '%s\n' 'SERA 127.0.0.1:5555' 'SERB 127.0.0.1:5556')" ] \
+	&& ok "doctor: no bare host for two devices on one host" || bad "doctor shared host" "$(cat -A "$FAKE/conf/devices.conf")"
+printf '%s\n' 'SER1 SER1' > "$FAKE/map"
+hook pre B 'adb -s SER1 shell true' >/dev/null
+o=$(CLAUDE_CODE_SESSION_ID=A doctor); [[ "$o" == *"SER1: in use by another session, not probed"* ]] && ok "doctor skips devices others hold" || bad "doctor skip held" "$o"
+reset
+
 # --- robustness
 o=$(echo 'not json' | "$DL" hook pre); [ -z "$o" ] && ok "bad hook input is ignored" || bad "bad hook input is ignored"
 o=$(DEVLOCK_CONF=/nonexistent hook pre A 'adb -s X1 shell true'); [[ "$o" != *deny* ]] && ok "works without devices.conf" || bad "works without devices.conf"

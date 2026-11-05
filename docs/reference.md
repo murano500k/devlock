@@ -13,7 +13,8 @@ them.
   one comma-separated argument or as several arguments before `--`.
 - A single `COMMAND` argument runs through `bash -c`. Several arguments run as an argv, without a
   shell.
-- `--timeout SEC`: how long to wait in line. Default 1800. `0` waits forever.
+- `--timeout DURATION`: how long to wait in line, in seconds or with a unit (`90s`, `30m`, `2h`).
+  Default 1800. `0` waits forever.
 - While waiting, polls once a second and prints `[devlock] busy: ...; queued` once to stderr.
 - When it gets the devices, prints `[devlock] holding ...` to stderr.
 - Environment of `COMMAND`:
@@ -46,7 +47,7 @@ end of turn to drop its lease at once instead of keeping the sticky window.
 
 Keeps the devices for the calling session until the TTL ends.
 
-- `--ttl`: a number with an optional unit `s`, `m` or `h`. Default 30m, maximum
+- `--ttl`: a number with an optional unit `s`, `m`, `h` or `d`. Default 30m, maximum
   `DEVLOCK_HOLD_MAX` (8h).
 - `--note`: shown to other sessions in refusals and in `status`.
 - Running it again on a held device replaces the hold, so it extends it.
@@ -56,11 +57,68 @@ Keeps the devices for the calling session until the TTL ends.
 - A hold taken with `CLAUDE_CODE_SESSION_ID` set ends at that session's SessionEnd. A hold taken
   without it (a terminal) ends only at its TTL or on `release` from the same shell.
 
-### `devlock status`
+### `devlock status [--json | --watch [--interval DURATION]]`
 
 Lists every live run, hold, lease and waiting job, one line each, and marks those of the calling
 session. A lease kept after its session's turn ended is marked `(idle after its turn)`. Prints
 `all devices free` when there is nothing, then the calling session's id.
+
+- `--watch`: redraws the list every `--interval` (default 2s, minimum 0.2s) until Ctrl-C.
+- `--json`: one object, `{"session": ..., "entries": [...]}`. Each entry has `device`, `kind`
+  (`run`, `hold`, `lease` or `waiting`), `session`, and the fields of that holder: `until`
+  (epoch seconds) for holds and leases, `pid`, `since`, `cmd` for runs and waiters, `note` for
+  holds, `idle` for idle leases, `position` (1 = next) for waiters.
+
+### `devlock whoami`
+
+Prints the calling session's id, whether it is a Claude Code session or a terminal
+(`shell-<parent pid>`), and everything that session holds or waits for.
+
+### `devlock check [--bg] [--session ID] [--json] COMMAND...`
+
+Runs the `pre` hook's decision on `COMMAND` without taking or changing anything, and prints the
+devices it uses and the verdict: `allow`, `deny: <reason>`, or `not a device command`.
+
+- A single `COMMAND` argument is the whole command line; several are joined as shell words.
+- `--bg`: decide as for a background Bash call or Monitor.
+- `--session ID`: decide for another session (default: the calling one).
+- `--json`: `{"verdict": "allow"|"deny"|"ignore", "devices": [...], "global_op": ..., "reason": ...,
+  "session": ...}`.
+- Exit 0 when the hook would let it run, 1 when it would refuse it.
+
+### `devlock log [--denied] [--since DURATION] [-n N] [--session ID] [--json]`
+
+Shows the hook's recent decisions on device commands, oldest first: time, `ALLOW` or `DENY`,
+session, devices, the command's first line, and for a refusal its reason.
+
+- `--denied`: refusals only. `--since 1h`: newer than that. `--session ID`: one session.
+- `-n N`: the last N (default 50, `0` = all).
+- `--json`: the raw records, one per line.
+
+Records live in `events.jsonl` in the state dir (rotated to `events.jsonl.1` at 2 MB). Commands
+that use no device are not recorded.
+
+### `devlock doctor [--fix]`
+
+Checks the setup, then the devices connected now.
+
+- Setup: the state dir is writable, `devices.conf` exists and is not a broken link, and
+  `settings.json` or `settings.local.json` in `$CLAUDE_CONFIG_DIR` (default `~/.claude`) registers
+  the hooks.
+- Devices: reads `ro.serialno` from every name `adb devices` lists as `device`, and groups the
+  names by it. A device is reported when one of its names, its serial, or the bare IP of a
+  `host:port` name is missing from its `devices.conf` line, when it has no line, when its names
+  are split over several lines (several locks for one device), or when one of its names sits on
+  another device's line (an address that moved to another device after DHCP). The bare host is
+  left out when two devices share it (different ports). Unauthorized or offline names, devices
+  another session holds, and generic serials such as `0123456789ABCDEF` are skipped with a warning.
+- What adb shows now wins. `--fix` writes the missing names into the device's line, merges split
+  lines into the one that starts with the serial, moves a name off another device's line, and
+  appends a line for a device that has none. It edits the file a symlink
+  points to, keeps the rest of the file as it is, and saves a backup as
+  `devices.conf.bak-<time>` in the state dir.
+- It only reads `ro.serialno`, on up to 8 devices at once.
+- Exit 0 when nothing needs fixing (after `--fix`: when everything was fixed), 1 otherwise.
 
 ### `devlock release [DEVICE]`
 
@@ -76,8 +134,7 @@ Entry points for Claude Code. They read the hook's JSON from stdin. Not meant to
 A session is identified by `CLAUDE_CODE_SESSION_ID`. Outside Claude Code (a plain terminal) it is
 `shell-<parent pid>`, so commands from one shell count as one session.
 
-The hooks get the session id from the hook input. `devlock run`, `wait`, `status` and `release`
-read it from the environment, which Claude Code sets for the commands it runs.
+The hooks get the session id from the hook input. The other commands read it from the environment, which Claude Code sets for the commands it runs.
 
 ## Holders
 

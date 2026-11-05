@@ -8,7 +8,16 @@
                      block until no other session holds the devices
   devlock hold [--ttl 30m] [--note TEXT] DEVICE[,DEVICE...]
                      keep the devices for this session across turns (max 8h; again = extend)
-  devlock status     who holds which device, and who is waiting
+  devlock status [--json | --watch [--interval 2s]]
+                     who holds which device, and who is waiting
+  devlock whoami     this session's id and what it holds
+  devlock check [--bg] [--session ID] [--json] COMMAND...
+                     would the hook allow COMMAND now? (exit 0 yes, 1 no; takes no lease)
+  devlock log [--denied] [--since 1h] [-n 50] [--session ID] [--json]
+                     the hook's recent decisions
+  devlock doctor [--fix]
+                     check the setup, and find connected names of one device (same ro.serialno)
+                     missing from devices.conf; --fix writes them in
   devlock release [DEVICE]
                      drop this session's leases and holds (all devices without DEVICE)
   devlock hook pre|post|stop|end
@@ -16,6 +25,7 @@
 
 State: $DEVLOCK_DIR (default ~/.local/state/devlock). Device names: devices.conf there.
 """
+import concurrent.futures
 import contextlib
 import fcntl
 import json
@@ -25,6 +35,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 STATE = os.environ.get("DEVLOCK_DIR") or os.path.expanduser("~/.local/state/devlock")
@@ -36,6 +47,7 @@ HOLD_MAX_SEC = int(os.environ.get("DEVLOCK_HOLD_MAX", str(8 * 3600)))
 BASH_DEFAULT_TIMEOUT_MS = 120000
 RUN_DEFAULT_TIMEOUT = 1800
 SELF = os.path.abspath(__file__)
+ADB = os.environ.get("DEVLOCK_ADB") or "adb"
 
 ADB_FREE = {"devices", "version", "help", "start-server", "connect", "keygen", "mdns", "pair",
             "host-features", "--version", "--help"}
@@ -127,16 +139,33 @@ def write_json(p, obj):
     os.replace(tmp, p)
 
 
-def log(line):
+def append_rotating(name, text, limit):
+    """Append to a file in the state dir, moving it to NAME.1 past limit bytes. A lock on the file
+    keeps two hooks from rotating it at once."""
     try:
         os.makedirs(STATE, exist_ok=True)
-        p = os.path.join(STATE, "hook.log")
-        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
-            os.replace(p, p + ".1")
-        with open(p, "a") as f:
-            f.write(f"{time.strftime('%F %T')} {line}\n")
+        p = os.path.join(STATE, name)
+        with open(p + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            if os.path.exists(p) and os.path.getsize(p) > limit:
+                os.replace(p, p + ".1")
+            with open(p, "a") as f:
+                f.write(text)
     except OSError:
         pass
+
+
+def log(line):
+    append_rotating("hook.log", f"{time.strftime('%F %T')} {line}\n", 1_000_000)
+
+
+def event(sess, verdict, devices, cmd, reason=None):
+    """One hook decision as a JSON line in events.jsonl, for `devlock log`."""
+    rec = {"t": round(time.time(), 3), "session": sess, "verdict": verdict, "devices": sorted(devices),
+           "cmd": cmd[:2000]}
+    if reason:
+        rec["reason"] = reason
+    append_rotating("events.jsonl", json.dumps(rec) + "\n", 2_000_000)
 
 
 @contextlib.contextmanager
@@ -687,8 +716,38 @@ def check_run(rest, use, depth):
 
 # ---------------------------------------------------------------- hooks
 
-def deny(sess, cmd, reason):
+def misuse(use, background):
+    """Why the pre hook refuses this command whatever the devices' state, or None."""
+    if use.problems:
+        return use.problems[0]
+    bg = use.devices if background else use.bg_devices
+    if bg:
+        return ("Background work on a shared device must hold it for its whole life: run it as "
+                f"`{SELF} run {','.join(sorted(bg))} -- <command>` (with the Bash tool's run_in_background, "
+                "not a trailing &).")
+    return None
+
+
+def verdict(use, sess, background, now):
+    """Why the pre hook refuses this command for sess, or None. Reads state, writes nothing."""
+    reason = misuse(use, background)
+    if reason:
+        return reason
+    if use.global_op:
+        busy = blockers(known_serials(), sess, now)
+        if busy:
+            return (f"`{use.global_op}` would cut off other sessions' devices ({'; '.join(busy)}). "
+                    "Do not run it while they are in use.")
+    busy = blockers(sorted(use.devices), sess, now)
+    if busy:
+        return (f"Device busy - {'; '.join(busy)}. Do not work around this (other spellings, deleting lock "
+                f"files). Queue with `{SELF} run <device> -- <command>` in the background, or use another device.")
+    return None
+
+
+def deny(sess, cmd, reason, devices=()):
     log(f"DENY {sess} {cmd!r}: {reason}")
+    event(sess, "deny", devices, cmd, reason)
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": reason}}))
     return 0
@@ -745,26 +804,15 @@ def hook(mode):
                                               "inflight": inflight})
         return 0
 
-    if use.problems:
-        return deny(sess, cmd, use.problems[0])
     background = tool == "Monitor" or bool(ti.get("run_in_background"))
-    bg = use.devices if background else use.bg_devices
-    if bg:
-        return deny(sess, cmd, "Background work on a shared device must hold it for its whole life: run it as "
-                    f"`{SELF} run {','.join(sorted(bg))} -- <command>` (with the Bash tool's run_in_background, "
-                    "not a trailing &).")
+    reason = misuse(use, background)
+    if reason:
+        return deny(sess, cmd, reason, use.devices)
     try:
         with mutex():
-            if use.global_op:
-                busy = blockers(known_serials(), sess, now)
-                if busy:
-                    return deny(sess, cmd, f"`{use.global_op}` would cut off other sessions' devices "
-                                f"({'; '.join(busy)}). Do not run it while they are in use.")
-            busy = blockers(sorted(use.devices), sess, now)
-            if busy:
-                return deny(sess, cmd, f"Device busy - {'; '.join(busy)}. Do not work around this (other "
-                            f"spellings, deleting lock files). Queue with `{SELF} run <device> -- <command>` "
-                            "in the background, or use another device.")
+            reason = verdict(use, sess, background, now)
+            if reason:
+                return deny(sess, cmd, reason, use.devices)
             deadline = now + max(LEASE_SEC, tool_timeout(ti) + LEASE_MARGIN)
             for s in use.devices:
                 l = lease(s, now) or {"until": 0}
@@ -773,9 +821,10 @@ def hook(mode):
                     inflight[call] = deadline
                 write_json(path(s, "lease"), {"session": sess, "until": max(l["until"], deadline),
                                               "inflight": inflight})
+            log(f"ALLOW {sess} {sorted(use.devices)} {cmd!r}")
+            event(sess, "allow", use.devices, cmd)
     except TimeoutError as e:
-        return deny(sess, cmd, f"devlock: {e}; retry in a moment.")
-    log(f"ALLOW {sess} {sorted(use.devices)} {cmd!r}")
+        return deny(sess, cmd, f"devlock: {e}; retry in a moment.", use.devices)
     return 0
 
 
@@ -799,13 +848,6 @@ def parse_device_args(cmd, argv, opts):
     if not names:
         sys.exit(f"devlock {cmd}: name at least one device")
     return vals, names, argv[i + 1:]
-
-
-def parse_seconds(cmd, opt, v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        sys.exit(f"devlock {cmd}: bad {opt} {v!r}")
 
 
 def acquire(serials, sess, timeout, entry=None, cancelled=lambda: False):
@@ -861,17 +903,13 @@ def adb_name(name):
     """The name adb knows the device by right now (a nickname is not one)."""
     serial = canon(name)
     names = [name, serial] + sorted((a for a, s in ALIASES.items() if s == serial and ":" in a), key=len, reverse=True)
-    try:
-        out = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10).stdout
-        connected = {l.split()[0] for l in out.splitlines()[1:] if l.strip()}
-    except (OSError, subprocess.SubprocessError):
-        connected = set()
+    connected = {n for n, _ in adb_devices() or []}
     return next((n for n in names if n in connected), name if name == serial or ":" in name else serial)
 
 
 def cmd_run(argv):
     opts, names, command = parse_device_args("run", argv, {"--timeout": RUN_DEFAULT_TIMEOUT})
-    timeout = parse_seconds("run", "--timeout", opts["--timeout"])
+    timeout = parse_duration("run", "--timeout", str(opts["--timeout"]))
     if not command:
         sys.exit("devlock run: missing -- COMMAND")
     serials = sorted({canon(n) for n in names})
@@ -919,7 +957,7 @@ def cmd_run(argv):
 
 def cmd_wait(argv):
     opts, names, _ = parse_device_args("wait", argv, {"--timeout": 0})
-    timeout = parse_seconds("wait", "--timeout", opts["--timeout"])
+    timeout = parse_duration("wait", "--timeout", str(opts["--timeout"]))
     pending = []
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda n, _: pending.append(n))
@@ -928,16 +966,9 @@ def cmd_wait(argv):
     return 0
 
 
-def parse_ttl(v):
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", v or "")
-    if not m:
-        sys.exit(f"devlock hold: bad --ttl {v!r} (e.g. 90s, 30m, 2h)")
-    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
-
-
 def cmd_hold(argv):
     opts, names, _ = parse_device_args("hold", argv, {"--ttl": "30m", "--note": ""})
-    ttl, note = parse_ttl(opts["--ttl"]), opts["--note"]
+    ttl, note = parse_duration("hold", "--ttl", opts["--ttl"]), opts["--note"]
     if not 0 < ttl <= HOLD_MAX_SEC:
         sys.exit(f"devlock hold: --ttl must be between 1s and {HOLD_MAX_SEC // 3600}h")
     sess = session_id()
@@ -960,31 +991,456 @@ def cmd_hold(argv):
     return 0
 
 
-def cmd_status():
-    sess = session_id()
-    shown = False
-    mine = lambda e: "  (this session)" if e.get("session") == sess else ""
+def parse_flags(cmd, argv, spec):
+    """Options from spec ({option: default}; a bool default makes it a flag) -> (values, positional).
+    Options end at the first positional argument or `--`."""
+    vals, pos, i = dict(spec), [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            pos += argv[i + 1:]
+            break
+        if pos:
+            pos.append(a)
+            i += 1
+            continue
+        if a in spec:
+            if isinstance(spec[a], bool):
+                vals[a], i = True, i + 1
+                continue
+            if i + 1 >= len(argv):
+                sys.exit(f"devlock {cmd}: {a} needs a value")
+            vals[a], i = argv[i + 1], i + 2
+            continue
+        if a.startswith("-") and a != "-":
+            sys.exit(f"devlock {cmd}: unknown option {a}")
+        pos.append(a)
+        i += 1
+    return vals, pos
+
+
+def parse_duration(cmd, opt, v):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", v or "")
+    if not m:
+        sys.exit(f"devlock {cmd}: bad {opt} {v!r} (e.g. 90s, 30m, 2h, 1d)")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def entries():
+    """(device, kind, entry) for every holder and waiter: kind is run, hold, lease or waiting."""
     for s in known_serials():
         for e in runs(s):
-            print(f"{s}  run: {describe(e)}{mine(e)}")
-            shown = True
+            yield s, "run", e
         h = hold(s)
         if h:
-            note = f" note={h['note']!r}" if h.get("note") else ""
-            print(f"{s}  hold: session={h['session']} until {clock(h['until'])}{note}{mine(h)}")
-            shown = True
+            yield s, "hold", h
         l = lease(s)
         if l:
-            idle = " (idle after its turn)" if l.get("idle") else ""
-            print(f"{s}  lease: session={l['session']} until {clock(l['until'])}{idle}{mine(l)}")
-            shown = True
-        for n, e in enumerate(waiters(s), 1):
-            print(f"{s}  waiting #{n}: {describe(e)}{mine(e)}")
-            shown = True
+            yield s, "lease", l
+        for e in waiters(s):
+            yield s, "waiting", e
+
+
+def entry_line(s, kind, e, n=0):
+    if kind == "run":
+        return f"{s}  run: {describe(e)}"
+    if kind == "hold":
+        note = f" note={e['note']!r}" if e.get("note") else ""
+        return f"{s}  hold: session={e['session']} until {clock(e['until'])}{note}"
+    if kind == "lease":
+        idle = " (idle after its turn)" if e.get("idle") else ""
+        return f"{s}  lease: session={e['session']} until {clock(e['until'])}{idle}"
+    return f"{s}  waiting #{n}: {describe(e)}"
+
+
+def public(s, kind, e, n=0):
+    out = {"device": s, "kind": kind}
+    out.update({k: v for k, v in e.items() if k not in ("procs", "inflight", "turn_ended")})
+    if kind == "waiting":
+        out["position"] = n
+    return out
+
+
+def numbered(items):
+    """entries() with each waiter's queue position."""
+    pos = {}
+    for s, kind, e in items:
+        n = 0
+        if kind == "waiting":
+            n = pos[s] = pos.get(s, 0) + 1
+        yield s, kind, e, n
+
+
+def print_status(sess):
+    shown = False
+    for s, kind, e, n in numbered(entries()):
+        print(entry_line(s, kind, e, n) + ("  (this session)" if e.get("session") == sess else ""))
+        shown = True
     if not shown:
         print("all devices free")
     print(f"(this session: {sess})")
+
+
+def cmd_status(argv):
+    opts, pos = parse_flags("status", argv, {"--json": False, "--watch": False, "--interval": "2"})
+    if pos:
+        sys.exit(f"devlock status: unexpected argument {pos[0]}")
+    sess = session_id()
+    if opts["--json"]:
+        if opts["--watch"]:
+            sys.exit("devlock status: --json and --watch do not mix")
+        print(json.dumps({"session": sess, "entries": [public(*x) for x in numbered(entries())]}, indent=2))
+        return 0
+    if not opts["--watch"]:
+        print_status(sess)
+        return 0
+    interval = max(0.2, parse_duration("status", "--interval", opts["--interval"]))
+    tty = sys.stdout.isatty()
+    try:
+        while True:
+            if tty:
+                sys.stdout.write("\033[H\033[2J")
+            print(f"devlock status  {time.strftime('%T')}  (every {interval:g}s, Ctrl-C to stop)\n")
+            print_status(sess)
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_whoami():
+    sess = session_id()
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        print(f"session: {sess} (Claude Code session)")
+    else:
+        print(f"session: {sess} (no Claude Code session: tied to the parent process {os.getppid()})")
+    mine = [x for x in numbered(entries()) if x[2].get("session") == sess]
+    if not mine:
+        print("holding nothing")
+    for s, kind, e, n in mine:
+        print(entry_line(s, kind, e, n))
     return 0
+
+
+def cmd_check(argv):
+    spec = {"--bg": False, "--session": "", "--json": False}
+    opts, pos = parse_flags("check", argv, spec)
+    while pos:
+        if pos[-1] in spec and spec[pos[-1]] is False:
+            opts[pos.pop()] = True
+        elif len(pos) > 1 and pos[-2] == "--session":
+            opts["--session"] = pos.pop()
+            pos.pop()
+        else:
+            break
+    if not pos:
+        sys.exit("devlock check: give the command, e.g. devlock check 'adb -s tv1 reboot'")
+    cmd = pos[0] if len(pos) == 1 else shlex.join(pos)
+    sess = opts["--session"] or session_id()
+    use = analyze(cmd)
+    reason = verdict(use, sess, opts["--bg"], time.time())
+    devices = sorted(use.devices)
+    device_cmd = bool(use.devices or use.global_op or use.problems)
+    res = "deny" if reason else ("allow" if device_cmd else "ignore")
+    if opts["--json"]:
+        print(json.dumps({"verdict": res, "devices": devices, "global_op": use.global_op, "reason": reason,
+                          "session": sess}))
+    elif res == "ignore":
+        print("not a device command: the hook lets it through")
+    else:
+        if devices:
+            print(f"devices: {', '.join(devices)}")
+        if use.global_op:
+            print(f"affects every device: {use.global_op}")
+        print(f"deny: {reason}" if reason else
+              f"allow{' (takes a lease on ' + ', '.join(devices) + ')' if devices else ''}")
+    return 1 if reason else 0
+
+
+def read_events():
+    out = []
+    for p in ("events.jsonl.1", "events.jsonl"):
+        try:
+            with open(os.path.join(STATE, p)) as f:
+                for line in f:
+                    with contextlib.suppress(ValueError):
+                        rec = json.loads(line)
+                        if isinstance(rec, dict):
+                            out.append(rec)
+        except OSError:
+            pass
+    return out
+
+
+def cmd_log(argv):
+    opts, pos = parse_flags("log", argv, {"--denied": False, "--since": "", "-n": "50", "--session": "",
+                                         "--json": False})
+    if pos:
+        sys.exit(f"devlock log: unexpected argument {pos[0]}")
+    try:
+        limit = int(opts["-n"])
+    except ValueError:
+        sys.exit(f"devlock log: bad -n {opts['-n']!r}")
+    since = time.time() - parse_duration("log", "--since", opts["--since"]) if opts["--since"] else 0
+    recs = [r for r in read_events()
+            if r.get("t", 0) >= since
+            and (not opts["--denied"] or r.get("verdict") == "deny")
+            and (not opts["--session"] or r.get("session") == opts["--session"])]
+    recs = recs[-limit:] if limit > 0 else recs
+    for r in recs:
+        if opts["--json"]:
+            print(json.dumps(r))
+            continue
+        first = (r.get("cmd") or "").strip().splitlines() or [""]
+        cmd = first[0][:120] + (" ..." if len(first) > 1 or len(first[0]) > 120 else "")
+        print(f"{time.strftime('%m-%d %T', time.localtime(r.get('t', 0)))}  {r.get('verdict', '?').upper():5}  "
+              f"{str(r.get('session'))[:8]}  {','.join(r.get('devices') or []) or '-':20}  {cmd}")
+        if r.get("reason"):
+            print(f"{'':16}{r['reason']}")
+    if not recs and not opts["--json"]:
+        print("no matching events")
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+GENERIC_SERIALS = {"", "unknown", "0123456789ABCDEF", "0123456789abcdef", "1234567890"}
+
+
+def adb(*args, timeout=10):
+    try:
+        r = subprocess.run([ADB, *args], capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def adb_devices():
+    """[(name, state)] that adb sees right now, or None when adb does not run."""
+    out = adb("devices")
+    if out is None:
+        return None
+    return [tuple(l.split()[:2]) for l in out.splitlines()[1:] if len(l.split()) >= 2]
+
+
+def conf_lines():
+    try:
+        with open(CONF) as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def device_names(line):
+    """The names on a devices.conf device line, or None for blanks, comments and script lines."""
+    body = (line or "").split("#", 1)[0].strip()
+    if not body or body.startswith("script "):
+        return None
+    return body.split()
+
+
+ADDR = re.compile(r"(\d+\.\d+\.\d+\.\d+):\d+")
+
+
+def is_address(name):
+    return bool(ADDR.fullmatch(name) or re.fullmatch(r"\d+\.\d+\.\d+\.\d+", name)
+                or "._adb" in name or name.startswith("adb-"))
+
+
+def wanted_names(serial, names, shared_hosts=()):
+    """Every name one device should be listed under: its serial, the adb names it was seen under,
+    and the bare host of a host:port address unless another device uses the same host."""
+    out = [serial]
+    for n in sorted(names, key=lambda n: (":" not in n, n)):
+        out.append(n)
+        m = ADDR.fullmatch(n)
+        if m and m.group(1) not in shared_hosts:
+            out.append(m.group(1))
+    return list(dict.fromkeys(out))
+
+
+def plan_aliases(groups, lines):
+    """groups: serial -> the adb names it answers to now. Returns (problems, new devices.conf lines).
+
+    What adb shows now wins: a device's names go on the line that starts with its serial (or with
+    one of its own names), lines split over several such lines are merged, and a name that now
+    reaches a device listed on another device's line (an address taken over after DHCP) is moved."""
+    lines, problems = list(lines), []
+    hosts = {}
+    for serial, names in groups.items():
+        for n in names:
+            m = ADDR.fullmatch(n)
+            if m:
+                hosts.setdefault(m.group(1), set()).add(serial)
+    shared = {h for h, sers in hosts.items() if len(sers) > 1}
+    owner = {}
+    for serial, names in groups.items():
+        for n in wanted_names(serial, names, shared):
+            owner[n] = serial
+    for serial, names in sorted(groups.items()):
+        want = wanted_names(serial, names, shared)
+        own, foreign = [], []
+        for i, l in enumerate(lines):
+            ns = device_names(l)
+            if not ns or not set(ns) & set(want):
+                continue
+            first = ns[0]
+            if first in want or (is_address(first) and first not in owner):
+                own.append(i)
+            else:
+                foreign.append(i)
+        for i in foreign:
+            ns = device_names(lines[i])
+            moved = [n for n in ns if n in want]
+            problems.append(f"{serial}: {', '.join(moved)} now reach{'es' if len(moved) == 1 else ''} this device "
+                            f"but {'is' if len(moved) == 1 else 'are'} listed on {ns[0]}'s line")
+            lines[i] = replace_names(lines[i], [n for n in ns if n not in want])
+        if not own:
+            if not foreign:
+                problems.append(f"{serial}: not in devices.conf (seen as {', '.join(sorted(names))})")
+            lines.append(" ".join(want))
+            continue
+        keep = next((i for i in own if device_names(lines[i])[0] == serial), own[0])
+        merged = list(device_names(lines[keep]))
+        for i in own:
+            merged += [n for n in device_names(lines[i]) if n not in merged]
+        missing = [n for n in want if n not in merged]
+        if len(own) > 1:
+            problems.append(f"{serial}: split over {len(own)} devices.conf lines, so one device has "
+                            f"{len(own)} locks: {' | '.join(' '.join(device_names(lines[i])) for i in own)}")
+        if missing:
+            problems.append(f"{serial}: not listed under {', '.join(missing)}")
+        if len(own) == 1 and not missing:
+            continue
+        lines[keep] = replace_names(lines[keep], merged + missing)
+        for i in sorted(own, reverse=True):
+            if i != keep:
+                del lines[i]
+    return problems, [l for l in lines if l is not None]
+
+
+def replace_names(line, names):
+    """The device line with these names, keeping its comment. None when no name is left."""
+    comment = line.split("#", 1)[1] if "#" in line else None
+    if not names:
+        return f"#{comment}" if comment is not None else None
+    return " ".join(names) + (f"  #{comment}" if comment is not None else "")
+
+
+def claude_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def hook_events_registered():
+    """Claude Code hook events that run devlock, from settings.json and settings.local.json, or None
+    when neither exists."""
+    found, seen = set(), False
+    for name in ("settings.json", "settings.local.json"):
+        data = read_json(os.path.join(claude_dir(), name))
+        if not isinstance(data, dict):
+            continue
+        seen = True
+        for ev, groups in (data.get("hooks") or {}).items():
+            for g in groups or []:
+                for h in (g or {}).get("hooks") or []:
+                    if "devlock" in str(h.get("command", "")) and " hook" in str(h.get("command", "")):
+                        found.add(ev)
+    return found if seen else None
+
+
+def write_conf(lines):
+    """Write devices.conf in place (through a symlink), keeping a backup in the state dir."""
+    target = os.path.realpath(CONF)
+    if os.path.exists(target):
+        backup = os.path.join(STATE, f"devices.conf.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        with open(target) as src, open(backup, "w") as dst:
+            dst.write(src.read())
+    tmp = f"{target}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    if os.path.exists(target):
+        os.chmod(tmp, os.stat(target).st_mode & 0o7777)
+    os.replace(tmp, target)
+    return target
+
+
+def cmd_doctor(argv):
+    opts, pos = parse_flags("doctor", argv, {"--fix": False})
+    if pos:
+        sys.exit(f"devlock doctor: unexpected argument {pos[0]}")
+    bad = 0
+
+    def say(tag, text):
+        nonlocal bad
+        bad += tag in ("FAIL", "FIX")
+        print(f"{tag:5} {text}")
+
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=STATE):
+            pass
+        say("ok", f"state dir {STATE}")
+    except OSError as e:
+        say("FAIL", f"state dir {STATE} is not writable: {e}")
+    if os.path.islink(CONF) and not os.path.exists(CONF):
+        say("FAIL", f"devices.conf is a broken link -> {os.readlink(CONF)}: every name is its own device")
+    elif not os.path.exists(CONF):
+        say("WARN", f"no {CONF}: each name is its own device (doctor --fix creates it)")
+    else:
+        real = os.path.realpath(CONF)
+        n = sum(1 for l in conf_lines() if device_names(l))
+        say("ok", f"devices.conf {CONF}{' -> ' + real if real != CONF else ''} ({n} devices)")
+    events = hook_events_registered()
+    need = ["PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+    if events is None:
+        say("WARN", "no Claude Code settings.json found: hooks not checked")
+    elif all(e in events for e in need):
+        say("ok", f"Claude Code hooks registered ({', '.join(sorted(events))})")
+    else:
+        say("FAIL", f"Claude Code hooks missing for {', '.join(e for e in need if e not in events)}: run install.sh")
+
+    devs = adb_devices()
+    if devs is None:
+        say("WARN", f"`{ADB} devices` failed: connected devices not checked")
+        return 1 if bad else 0
+    sess, probe = session_id(), []
+    for name, state in devs:
+        if state != "device":
+            say("WARN", f"{name}: {state}, cannot read its serial")
+        elif blockers([canon(name)], sess):
+            say("WARN", f"{name}: in use by another session, not probed (run doctor again when it is free)")
+        else:
+            probe.append(name)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        serials = list(pool.map(lambda n: (adb("-s", n, "shell", "getprop", "ro.serialno", timeout=10) or "").strip(),
+                                probe))
+    groups = {}
+    for name, serial in zip(probe, serials):
+        if serial in GENERIC_SERIALS:
+            say("WARN", f"{name}: ro.serialno is {serial or 'empty'!r}, not unique enough to group by")
+            continue
+        groups.setdefault(serial, set()).add(name)
+    problems, fixed = plan_aliases(groups, conf_lines())
+    for serial, names in sorted(groups.items()):
+        if not any(p.startswith(serial + ":") for p in problems):
+            say("ok", f"{serial}: {', '.join(sorted(names))} share one lock")
+    for p in problems:
+        say("FIX", p)
+    if problems and not opts["--fix"]:
+        print("\nSuggested devices.conf (device lines that change):")
+        old = set(conf_lines())
+        for l in fixed:
+            if device_names(l) and l not in old:
+                print(f"  {l}")
+        print("Apply with `devlock doctor --fix`.")
+    elif problems:
+        try:
+            target = write_conf(fixed)
+            print(f"\nupdated {target} (backup in {STATE})")
+            bad -= len(problems)
+        except OSError as e:
+            say("FAIL", f"could not write devices.conf: {e}")
+    return 1 if bad else 0
 
 
 def main():
@@ -1002,7 +1458,15 @@ def main():
     if a[:1] == ["wait"]:
         return cmd_wait(a[1:])
     if a[:1] == ["status"]:
-        return cmd_status()
+        return cmd_status(a[1:])
+    if a[:1] == ["whoami"]:
+        return cmd_whoami()
+    if a[:1] == ["check"]:
+        return cmd_check(a[1:])
+    if a[:1] == ["log"]:
+        return cmd_log(a[1:])
+    if a[:1] == ["doctor"]:
+        return cmd_doctor(a[1:])
     if a[:1] == ["hold"]:
         return cmd_hold(a[1:])
     if a[:1] == ["release"]:

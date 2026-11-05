@@ -53,15 +53,19 @@ script my-ota-tool/run\.py\s+(push|install)
 devlock run [--timeout SEC] DEVICE[,DEVICE...] -- COMMAND...
 devlock wait [--timeout SEC] DEVICE[,DEVICE...]
 devlock hold [--ttl 30m] [--note TEXT] DEVICE[,DEVICE...]
-devlock status
+devlock status [--json | --watch]
+devlock whoami
+devlock check [--bg] COMMAND...
+devlock log [--denied] [--since 1h]
+devlock doctor [--fix]
 devlock release [DEVICE]
 ```
 
 `run` sets `ANDROID_SERIAL` when one device is named, queues for up to 30 min by default (`0` =
 forever, exit 75 on timeout). `SKILL.md` is what the agent reads.
 
-State and the decision log live in `$DEVLOCK_DIR` (default `~/.local/state/devlock`, log in
-`hook.log`).
+State and the decision log live in `$DEVLOCK_DIR` (default `~/.local/state/devlock`; `devlock log`
+shows the decisions, `hook.log` has the debug log).
 
 ## Documentation
 

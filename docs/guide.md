@@ -156,7 +156,24 @@ R58N67890CD  hold: session=shell-4410 until 15:30:00 note='HDMI-CEC debugging'
 ```
 
 `devlock release [DEVICE]` drops your session's leases and holds early. Runs end when their command
-does.
+does. `devlock status --watch` keeps the list on screen, `devlock whoami` shows only your session.
+
+To see whether a command would be let through right now, without running it or taking anything:
+
+```
+$ devlock check 'adb -s 192.168.0.50:5555 reboot'
+devices: R58M12345AB
+deny: Device busy - R58M12345AB: another session's run holds it (...)
+```
+
+`devlock log --denied --since 1h` lists recent refusals with their reasons.
+
+### Keeping devices.conf complete
+
+A name missing from `devices.conf` is a separate lock, so two sessions can reach one device under
+two names. `devlock doctor` reads `ro.serialno` from every connected device, groups the names that
+belong to the same one and reports gaps; `devlock doctor --fix` writes them into the file. Run it
+after you plug in a new device or a device gets a new address.
 
 ## What a refusal looks like
 
@@ -189,9 +206,10 @@ device (`adb -s`, `ANDROID_SERIAL`, `fastboot -s`); run long or background devic
 |---|---|
 | Every device command is refused with "Name the device" | The command lets adb choose. Add `-s <serial>` or `ANDROID_SERIAL=<serial>`. |
 | "devlock needs the device spelled out, not a variable" | `adb -s $DEV` cannot be checked before it runs. Write the serial out, or wrap the work in `devlock run <dev> -- ...` and use `$ANDROID_SERIAL` inside it. |
-| The same TV is locked twice under two names | Its names are not on one line in `devices.conf`. Add the missing address. |
+| The same TV is locked twice under two names | Its names are not on one line in `devices.conf`. Run `devlock doctor --fix` while it is connected under both. |
 | A device stays busy after a session crashed | A lease ends on its own within 5 minutes (or the Bash timeout plus one minute). A run ends when its processes are gone. A hold ends at its TTL. `devlock status` shows the holder. Do not delete state files while a session may still be using the device. |
 | A device stays busy for 2 minutes after the other session finished | That is the sticky window, kept for the other session's next prompt. Queue with `devlock run`: a waiting run ends the window at once. |
 | "devlock state is locked by a stuck process" | Another devlock process held the state lock for over 5 seconds. Retry. If it repeats, look for a hung `devlock` process. |
 | Hooks seem to do nothing | Restart the session. Check that `~/.claude/settings.json` has `devlock hook pre` under `PreToolUse`, and read `~/.local/state/devlock/hook.log`. |
-| A command was wrongly refused or wrongly allowed | `hook.log` records every decision with the full command. Please open an issue with the line. |
+| A command was wrongly refused or wrongly allowed | `devlock check '<command>'` shows the decision and `devlock log` the recent ones. Please open an issue with the command. |
+| Something else looks off | `devlock doctor` checks the state dir, `devices.conf`, the hooks and the connected devices. |

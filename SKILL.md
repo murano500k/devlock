@@ -28,7 +28,9 @@ the same device. Rules for every session:
   Background Bash, Monitor and trailing-`&` commands that touch a device are refused unless wrapped
   like this. The run holds the devices until its whole process group exits.
   A single quoted command runs through `bash -c`; list every device the job touches.
-- `devlock status` shows who holds what and who is waiting. `adb kill-server` / `adb disconnect` (no address) are refused
+- `devlock status` shows who holds what and who is waiting; `devlock whoami` what this session holds.
+  `devlock check '<command>'` says whether a command would be allowed, without running it.
+  `devlock log --denied` lists recent refusals. `adb kill-server` / `adb disconnect` (no address) are refused
   while another session uses any device.
 - **Never work around a refusal** (other spellings, deleting state files, `adb -d`). Queue with
   `devlock run`, use another device, or ask the user.
@@ -39,7 +41,8 @@ the same device. Rules for every session:
 
 1. `./install.sh --conf <your devices.conf>`: links this repo as the skill, puts `devlock` on PATH,
    links the device list into `~/.local/state/devlock/` and registers the hooks.
-2. New device or address: add it to that devices.conf - one line per device, serial first, then
+2. New device or address: `devlock doctor` finds connected names of one device (same
+   `ro.serialno`) that are missing from devices.conf, `devlock doctor --fix` adds them. By hand: add it to that devices.conf - one line per device, serial first, then
    every other name (IP:port, bare IP, nickname). Each line is one lock. `script <regex>` lines name
    scripts that fall back to a default device; they are refused unless one is named.
 
