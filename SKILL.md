@@ -5,13 +5,13 @@ description: Share adb/fastboot test devices (TVs, tablets, dongles) between Cla
 
 # devlock
 
-A user-level hook (`devlock hook pre|post|stop`, registered by `install.sh`) keeps two sessions off
+A user-level hook (`devlock hook pre|post|stop|end`, registered by `devlock install`) keeps two sessions off
 the same device. Rules for every session:
 
 - **Always name the device**: `adb -s <serial|address>` or `ANDROID_SERIAL=<...>`, `fastboot -s <serial>`,
   `scrcpy -s <...>`.
   adb/fastboot without one, `adb -d/-e/-t`, and `-s $VAR` are refused. Skill scripts that fall back
-  to a default device (listed as `script` lines in devices.conf) need `--device <name>`.
+  to a default device (listed under `scripts` in the device list) need `--device <name>`.
 - Your first device command gives your session a **lease** (5 min, or the Bash timeout + 1 min if
   longer, refreshed after each command). When your turn ends it shrinks to 2 minutes, so the user's
   next prompt still finds the device yours; it is dropped at once if another session is waiting
@@ -35,24 +35,20 @@ the same device. Rules for every session:
 - **Never work around a refusal** (other spellings, deleting state files, `adb -d`). Queue with
   `devlock run`, use another device, or ask the user.
 
-`devlock` is `~/.claude/skills/devlock/devlock` (also linked into `~/.local/bin`). The same rules
-apply in Codex and Cursor sessions when their hooks are installed.
+`devlock` is on PATH (installed with `uv tool install devlock`, or linked into `~/.local/bin` from
+a checkout). The same rules apply in Codex and Cursor sessions when their hooks are installed.
 
 ## Setup
 
-1. `./install.sh --conf <your devices.conf>`: links this repo as the skill, puts `devlock` on PATH,
-   links the device list into `~/.local/state/devlock/` and registers the hooks for Claude Code,
-   Codex and Cursor (whichever are set up; `--claude/--codex/--cursor` to choose).
+1. `devlock install [--conf <your devices.toml>]` registers the hooks for Claude Code, Codex and
+   Cursor (whichever are set up; `--claude/--codex/--cursor` to choose) and links the device list
+   into `~/.local/state/devlock/`. From a checkout, `./install.sh` does the same and links the repo
+   as this skill.
 2. New device or address: `devlock doctor` finds connected names of one device (same
-   `ro.serialno`) that are missing from devices.conf, `devlock doctor --fix` adds them. By hand: add it to that devices.conf - one line per device, serial first, then
-   every other name (IP:port, bare IP, nickname). Each line is one lock. `script <regex>` lines name
-   scripts that fall back to a default device; they are refused unless one is named.
+   `ro.serialno`) that are missing from the device list, `devlock doctor --fix` adds them. By hand:
+   in `devices.toml`, `[devices]` maps each serial to its other names (IP:port, bare IP, nickname);
+   each entry is one lock. `scripts = ['<regex>', ...]` names scripts that fall back to a default
+   device; they are refused unless one is named.
 
-## Tests
-
-- `tests/smoke.sh` - hook and run semantics on fake devices (no adb, ~1 min).
-- `tests/integration.sh` - two real `claude -p` sessions against the installed hooks (fake device).
-- `tests/device.sh SERIAL ADDRESS` - real device, read-only commands; hold the device first.
-
-Decisions are logged to `~/.local/state/devlock/hook.log`. The hook fails open on its own bugs
-(logged as ERROR) so a devlock fault never blocks every Bash call.
+Decisions: `devlock log` (debug log in `~/.local/state/devlock/hook.log`). The hook fails open on
+its own bugs (logged as ERROR) so a devlock fault never blocks every shell command.

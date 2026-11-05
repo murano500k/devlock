@@ -4,7 +4,7 @@ set -u
 DL=$(cd "$(dirname "$0")/.." && pwd)/devlock
 export DEVLOCK_DIR=$(mktemp -d)
 trap 'rm -rf "$DEVLOCK_DIR"' EXIT
-unset DEVLOCK_CONF CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID
+unset DEVLOCK_CONF CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CLAUDE_CONFIG_DIR CODEX_HOME
 # stop frees at once unless a test sets the sticky window itself
 export DEVLOCK_STICKY_SEC=0
 cat > "$DEVLOCK_DIR/devices.conf" <<'EOF'
@@ -562,6 +562,76 @@ doctor --fix >/dev/null
 printf '%s\n' 'SER1 SER1' > "$FAKE/map"
 hook pre B 'adb -s SER1 shell true' >/dev/null
 o=$(CLAUDE_CODE_SESSION_ID=A doctor); [[ "$o" == *"SER1: in use by another session, not probed"* ]] && ok "doctor skips devices others hold" || bad "doctor skip held" "$o"
+reset
+
+# --- devices.toml
+TOML=$DEVLOCK_DIR/t/devices.toml
+mkdir -p "$DEVLOCK_DIR/t"
+cat > "$TOML" <<'TOMLEOF'
+# lab devices
+scripts = ['fake-ota/run\.py\s+(push|install)']
+
+[devices]
+SER1 = ["10.0.0.2:5555", "10.0.0.2", "tva"]  # living room
+"SER2" = ["10.0.0.20:5555", "tvb"]
+
+[other]
+x = 1
+TOMLEOF
+th() { DEVLOCK_CONF="$TOML" hook "$@"; }
+o=$(th pre A 'adb -s tva shell true'); [[ "$o" != *deny* ]] && ok "toml: allow by nickname" || bad "toml allow" "$o"
+o=$(th pre B 'adb -s 10.0.0.2:5555 shell true'); [[ "$o" == *"Device busy - SER1"* ]] && ok "toml: aliases share one lock" || bad "toml alias" "$o"
+o=$(th pre B 'python3 fake-ota/run.py push x.zip'); [[ "$o" == *"picks a test device"* ]] && ok "toml: script patterns" || bad "toml scripts" "$o"
+reset
+printf '%s\n' '10.0.0.2:5555 SER1' '10.0.0.77:5555 SER2' '10.0.0.90:5555 NEW1' > "$FAKE/map"
+tdoctor() { HOME="$FAKE" DEVLOCK_ADB="$FAKE/adb" DEVLOCK_CONF="$TOML" CLAUDE_CONFIG_DIR="$FAKE" "$DL" doctor "$@"; }
+o=$(tdoctor); [ $? = 1 ] && [[ "$o" == *'"SER2" = ["10.0.0.20:5555", "tvb", "10.0.0.77:5555", "10.0.0.77"]'* ]] \
+	&& ok "toml doctor: suggests TOML lines" || bad "toml doctor suggest" "$o"
+tdoctor --fix >/dev/null
+want='# lab devices
+scripts = ['"'"'fake-ota/run\.py\s+(push|install)'"'"']
+
+[devices]
+SER1 = ["10.0.0.2:5555", "10.0.0.2", "tva"]  # living room
+"SER2" = ["10.0.0.20:5555", "tvb", "10.0.0.77:5555", "10.0.0.77"]
+"NEW1" = ["10.0.0.90:5555", "10.0.0.90"]
+
+[other]
+x = 1'
+[ "$(cat "$TOML")" = "$want" ] && ok "toml doctor --fix keeps the rest of the file" || bad "toml doctor --fix" "$(cat "$TOML")"
+o=$(tdoctor); [ $? = 0 ] && ok "toml doctor clean after --fix" || bad "toml doctor after fix" "$o"
+printf '%s\n' '[devices]' 'SER2 = [' '  "tvb",' ']' > "$TOML"
+o=$(tdoctor --fix); [[ "$o" == *"would not parse"* ]] && [ "$(sed -n 2p "$TOML")" = 'SER2 = [' ] \
+	&& ok "toml doctor --fix leaves a file it cannot edit safely" || bad "toml multi-line" "$o"
+: > "$TOML"
+tdoctor --fix >/dev/null
+[ "$(head -1 "$TOML")" = "[devices]" ] && grep -q '"NEW1" = \["10.0.0.90:5555", "10.0.0.90"\]' "$TOML" \
+	&& ok "toml doctor --fix starts a [devices] table" || bad "toml new table" "$(cat "$TOML")"
+cat > "$TOML" <<'TOMLEOF'
+scripts = 'fake-ota/run\.py'
+[devices]
+SER1 = ["tva"]
+scripts = ['other-tool\.sh']
+"SER\\5" = ["odd"]
+
+[[profiles]]
+targets = ["10.0.0.2:5555"]
+TOMLEOF
+o=$(th pre A 'python3 build.py'); [[ "$o" != *deny* ]] && ok "toml: a scripts string is one pattern" || bad "toml scripts string" "$o"
+o=$(th pre A './other-tool.sh'); [[ "$o" == *"picks a test device"* ]] && ok "toml: scripts under [devices] still apply" || bad "toml misplaced scripts" "$o"
+printf '%s\n' '10.0.0.2:5555 SER1' > "$FAKE/map"
+before=$(cat "$TOML"); tdoctor --fix >/dev/null
+[ "$(sed -n '/\[\[profiles\]\]/,$p' "$TOML")" = "$(printf '%s\n' '[[profiles]]' 'targets = ["10.0.0.2:5555"]')" ] \
+	&& grep -q '^"SER\\\\5" = \["odd"\]$' "$TOML" && grep -q '^SER1 = \["tva", "10.0.0.2:5555", "10.0.0.2"\]' "$TOML" \
+	&& ok "toml doctor --fix leaves [[arrays]] and escaped keys alone" || bad "toml arrays/escapes" "$(cat "$TOML")"
+reset
+I=$DEVLOCK_DIR/inst; mkdir -p "$I/state" "$I/home/.claude"
+ln -s "$DEVLOCK_DIR/devices.conf" "$I/state/devices.conf"
+HOME="$I/home" DEVLOCK_DIR="$I/state" "$DL" install --claude --conf "$TOML" >/dev/null
+[ -L "$I/state/devices.toml" ] && [ ! -e "$I/state/devices.conf" ] && [ -f "$I/home/.claude/skills/devlock/SKILL.md" ] \
+	&& jq -e '.hooks.PreToolUse[0].hooks[0].command | endswith("devlock hook pre")' "$I/home/.claude/settings.json" >/dev/null \
+	&& ok "install: toml link replaces conf link, skill and hooks in place" || bad "install toml" "$(ls -la "$I/state" "$I/home/.claude")"
+o=$(HOME="$I/home" DEVLOCK_DIR="$I/state" "$DL" status); [[ "$o" == "all devices free"* ]] && ok "status reads devices.toml" || bad "status toml" "$o"
 reset
 
 # --- robustness

@@ -129,7 +129,7 @@ registers the run as soon as there are none.
 | exception in the hook | logged as `ERROR`, the call is allowed |
 | hook input not JSON, or no session id | allowed |
 | state lock not obtained within 5 s | the call is denied with "retry" |
-| `devices.conf` missing or a broken link | warning in the log; every name is its own device |
+| the device list missing, unreadable or a broken link | warning in the log; every name is its own device |
 | invalid `script` regex | that line is skipped, with a warning |
 | session crashes | its leases expire; its runs end when their processes are gone |
 | machine reboots | leases expire; runs are dead because their pids are gone |

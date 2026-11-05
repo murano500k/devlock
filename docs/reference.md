@@ -9,7 +9,7 @@ Exact behaviour of the current version. For setup and workflow see [guide.md](gu
 Waits until no other session holds any of the devices, then runs `COMMAND` while holding all of
 them.
 
-- `DEVICE` is any name from `devices.conf`, or any adb or fastboot serial. Names can be given as
+- `DEVICE` is any name from the device list, or any adb or fastboot serial. Names can be given as
   one comma-separated argument or as several arguments before `--`.
 - A single `COMMAND` argument runs through `bash -c`. Several arguments run as an argv, without a
   shell.
@@ -102,12 +102,12 @@ that use no device are not recorded.
 
 Checks the setup, then the devices connected now.
 
-- Setup: the state dir is writable, `devices.conf` exists and is not a broken link, and
+- Setup: the state dir is writable, the device list exists and is not a broken link, and
   `settings.json` or `settings.local.json` in `$CLAUDE_CONFIG_DIR` (default `~/.claude`) registers
   the hooks.
 - Devices: reads `ro.serialno` from every name `adb devices` lists as `device`, and groups the
   names by it. A device is reported when one of its names, its serial, or the bare IP of a
-  `host:port` name is missing from its `devices.conf` line, when it has no line, when its names
+  `host:port` name is missing from its entry in the device list, when it has none, when its names
   are split over several lines (several locks for one device), or when one of its names sits on
   another device's line (an address that moved to another device after DHCP). The bare host is
   left out when two devices share it (different ports). Unauthorized or offline names, devices
@@ -116,7 +116,7 @@ Checks the setup, then the devices connected now.
   lines into the one that starts with the serial, moves a name off another device's line, and
   appends a line for a device that has none. It edits the file a symlink
   points to, keeps the rest of the file as it is, and saves a backup as
-  `devices.conf.bak-<time>` in the state dir.
+  `devices.toml.bak-<time>` (or `.conf`) in the state dir.
 - It only reads `ro.serialno`, on up to 8 devices at once.
 - Exit 0 when nothing needs fixing (after `--fix`: when everything was fixed), 1 otherwise.
 
@@ -141,7 +141,9 @@ other hook. Without an agent flag: every agent whose config dir exists (`~/.clau
 - Codex: also adds the state dir to `writable_roots` under `[sandbox_workspace_write]` in
   `config.toml`, so commands in Codex's sandbox can run `devlock run`, `hold` and `release`. If the
   table already exists it only prints the line to add.
-- `--conf PATH` links `PATH` as the state dir's `devices.conf`.
+- `--conf PATH` links `PATH` as the state dir's `devices.toml` or `devices.conf`, by its extension.
+- Claude Code: also installs `SKILL.md` as the `devlock` skill, unless `~/.claude/skills/devlock` is
+  a link (a checkout installed with `install.sh`).
 - `--exe CMD`: how the hooks call devlock. Default: this file's absolute path, or
   `$HOME/.claude/skills/devlock/devlock` when that link points to it.
 
@@ -225,7 +227,7 @@ several devices.
 | `-s $VAR`, any value with `$`, backtick, `*` or `?` | `devlock needs the device spelled out` | write the name out, or use `devlock run` |
 | `ANDROID_SERIAL=$X` (any non-literal value) | `ANDROID_SERIAL must be a literal serial` | same |
 | Gradle device task without `ANDROID_SERIAL` | `... runs on every connected device` | `ANDROID_SERIAL=<serial> ./gradlew ...` |
-| a `script` pattern from `devices.conf` with no device named in the command | `This script picks a test device on its own` | pass `--device <name>` (any device name in the command counts) |
+| a `scripts` pattern from the device list with no device named in the command | `This script picks a test device on its own` | pass `--device <name>` (any device name in the command counts) |
 | device held by another session | `Device busy - ...` with the holder | `devlock run` in the background, another device, or ask the user |
 | `adb kill-server`, `adb disconnect` with no address, `adb reconnect` with no device, while another session holds any device | ``... would cut off other sessions' devices`` | wait until the others are done |
 | device command in background Bash (`run_in_background`), in `Monitor`, or ended by a single `&` | `Background work on a shared device` | wrap it: `devlock run <devs> -- <command>` |
@@ -250,15 +252,43 @@ several devices.
 
 Scripts and interpreters (`*.sh`, `*.py`, any path with `/`, `python`, `python3`, `node`, `uv`,
 `perl`, `ruby`, `bash script.sh`, `gradlew`, `make`, `pytest`) cannot be looked into. For those,
-devlock locks every device from `devices.conf` whose name appears in the command, plus the device
+devlock locks every device from the device list whose name appears in the command, plus the device
 in `ANDROID_SERIAL`. Names count only as whole words.
 
 Not covered: `eval`, `source`/`.`, shell functions and aliases, devices named through variables
 that are set elsewhere, and scripts that call adb without the device appearing in the command.
 
-## devices.conf
+## Device list
 
-Location: `$DEVLOCK_CONF`, default `$DEVLOCK_DIR/devices.conf` (`install.sh --conf` links it there).
+Location: `$DEVLOCK_CONF`, else `devices.toml` in `$DEVLOCK_DIR`, else `devices.conf` there (the
+older format, still read). `devlock install --conf PATH` links your file there under the name that
+matches its format, and removes a link of the other format.
+
+### devices.toml
+
+```toml
+scripts = ['ota-tool/run\.py\s+(push|install)']
+
+[devices]
+R58M12345AB = ["192.168.0.50:5555", "192.168.0.50", "pixel"]
+"192.168.0.60:5555" = ["living-room-tv"]
+```
+
+- `[devices]`: each key is a device's canonical name (its serial where it has one: it names the
+  lock, the state files and the entries in `status`); the value lists every other name of that
+  device (a single string is accepted too). Every name refers to the same lock. Names are matched
+  exactly (case-sensitive). Keys with `:` or other punctuation need quotes.
+- `scripts`: Python regexes (a list, or one string). A command that matches one and names no device
+  is refused. It must come before `[devices]`; inside the table it is still used, with a warning in
+  the log.
+- A name that is in no entry is its own device. An invalid regex or entry is skipped and logged; a
+  file that does not parse is logged and gives no aliases. Reading it needs Python 3.11+ or the
+  `tomli` package (installed with devlock on older Pythons).
+- `devlock doctor --fix` edits only single-line `key = [...]` entries of `[devices]`, adds new
+  devices after the last one, keeps every other line as it is, and does not write a result that
+  would not parse.
+
+### devices.conf
 
 - `#` starts a comment, on its own line or after the names.
 - **Device line:** whitespace-separated names. The first is the canonical name: it names the lock,
@@ -274,27 +304,22 @@ Location: `$DEVLOCK_CONF`, default `$DEVLOCK_DIR/devices.conf` (`install.sh --co
 | Variable | Default | Used for |
 |---|---|---|
 | `DEVLOCK_DIR` | `~/.local/state/devlock` | state, log, default config location |
-| `DEVLOCK_CONF` | `$DEVLOCK_DIR/devices.conf` | device list |
+| `DEVLOCK_CONF` | `$DEVLOCK_DIR/devices.toml` or `devices.conf` | device list |
 | `DEVLOCK_LEASE_SEC` | `300` | lease length after each command |
 | `DEVLOCK_STICKY_SEC` | `120` | how long a lease outlives its turn; `0` drops it at the end of the turn |
 | `DEVLOCK_HOLD_MAX` | `28800` | longest `devlock hold --ttl`, in seconds |
-| `CLAUDE_CODE_SESSION_ID` | set by Claude Code | session identity |
+| `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID` | set by Claude Code, Codex | session identity |
+| `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | `~/.claude`, `~/.codex` | where `install` and `doctor` find the agents' config |
+| `DEVLOCK_ADB` | `adb` | the adb that `doctor` and `run` call |
 | `DEVLOCK_HELD` | set by `devlock run` | devices the run holds |
 | `ANDROID_SERIAL` | set by `devlock run` (one device) | device for adb, Gradle and scrcpy |
 
-## Hooks registered by install.sh
+## Hooks
 
-| Event | Matcher | Command |
-|---|---|---|
-| `PreToolUse` | `Bash\|Monitor` | `devlock hook pre` |
-| `PostToolUse` | `Bash` | `devlock hook post` |
-| `PostToolUseFailure` | `Bash` | `devlock hook post` |
-| `Stop` | all | `devlock hook stop` |
-| `SessionEnd` | all | `devlock hook end` |
-
-Each has a 10 s timeout. A SessionEnd event is handled as `end` whatever the argument, so
-installs from before `hook end` existed still release at session end. Re-running `install.sh` replaces older devlock entries and leaves other
-hooks alone.
+`devlock install` registers them (see its section for the files and events). Each has a 10 s
+timeout (Codex's SessionEnd: 3 s, its maximum). A SessionEnd event is handled as `end` whatever
+the argument, so installs from before `hook end` existed still release at session end. Running
+`install` again replaces older devlock entries and leaves other hooks alone.
 
 ## Files
 
@@ -304,11 +329,12 @@ All in `$DEVLOCK_DIR`:
 |---|---|
 | `<device>.lease` | the current lease: `{"session", "until", "inflight": {tool_use_id: deadline}}`, or `null` |
 | `<device>.runs` | list of runs: session, pid, process start time, process group, start time, command |
-| `<device>.hold` | the current hold: `{"session", "kind": "claude"\|"shell", "until", "note", "since"}`, or `null` |
+| `<device>.hold` | the current hold: `{"session", "kind": "claude"\|"codex"\|"shell", "until", "note", "since"}`, or `null` |
 | `<device>.queue` | waiting `run`/`wait` processes, same fields as a run without the process group |
 | `.mutex` | lock file for every state change |
 | `hook.log`, `hook.log.1` | every allow, deny and error, with the command; rotated at 1 MB |
-| `devices.conf` | link to your device list |
+| `events.jsonl`, `events.jsonl.1` | the decisions `devlock log` shows; rotated at 2 MB |
+| `devices.toml` or `devices.conf` | link to your device list |
 
 `<device>` is the canonical name, with characters other than letters, digits, `.`, `_`, `:` and `-`
 replaced by `_`.

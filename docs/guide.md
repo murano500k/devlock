@@ -36,26 +36,27 @@ person, Android Studio, or a script that calls adb without naming the device in 
 
 ## Install
 
-Requirements: Linux or macOS, Python 3.9 or newer, bash, and Claude Code, Codex or Cursor.
+Requirements: Linux or macOS, Python 3.9 or newer, and Claude Code, Codex or Cursor.
 
 ```bash
-git clone https://github.com/murano500k/devlock ~/projects/devlock
-~/projects/devlock/install.sh --conf ~/my-lab/devices.conf
+uv tool install devlock          # or: pipx install devlock
+devlock install --conf ~/my-lab/devices.toml
 ```
 
-`install.sh` is safe to run again. It does four things:
-
-- links the repo as the `devlock` skill at `~/.claude/skills/devlock`, so agents can read `SKILL.md`;
-- links `devlock` into `~/.local/bin`;
-- links your device list to `~/.local/state/devlock/devices.conf`;
-- runs `devlock install`, which registers the hooks for every agent set up on the machine, after
-  saving a backup of each file it changes:
+`devlock install` is safe to run again. It links your device list to
+`~/.local/state/devlock/devices.toml` and registers the hooks for every agent set up on the
+machine, after saving a backup of each file it changes:
   - Claude Code: `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` if set);
   - Codex: `~/.codex/hooks.json` (`$CODEX_HOME` if set), and the state dir is added to
     `writable_roots` in `config.toml` so `devlock run` works inside Codex's sandbox;
   - Cursor: `~/.cursor/hooks.json`.
 
-  `--claude`, `--codex`, `--cursor` limit it to those agents.
+`--claude`, `--codex`, `--cursor` limit it to those agents. For Claude Code it also installs the
+`devlock` skill (`~/.claude/skills/devlock/SKILL.md`).
+
+To run from a checkout instead (to hack on devlock), `git clone
+https://github.com/murano500k/devlock && devlock/install.sh --conf ~/my-lab/devices.toml`. It links
+the checkout as the Claude skill and `devlock` into `~/.local/bin`, then runs `devlock install`.
 
 Restart running sessions afterwards; hooks are read when a session starts. Codex runs a new hook
 only after you approve it once with `/hooks`.
@@ -76,27 +77,31 @@ never work around a refusal. Differences:
 
 ## Describe your devices
 
-A device that is reachable under more than one name needs a line in `devices.conf`. Otherwise
+A device that is reachable under more than one name needs an entry in `devices.toml`. Otherwise
 `adb -s 192.168.0.50:5555` and `adb -s R58M12345AB` count as two devices, even when they are
 the same TV over ethernet and USB.
 
-```
-# serial first, then every other name: adb address, bare IP, nickname
-R58M12345AB  192.168.0.50:5555  192.168.0.50  tv1
-192.168.0.60:5555  192.168.0.60  dongle1
+```toml
+[devices]
+# serial, then every other name: adb address, bare IP, nickname
+R58M12345AB = ["192.168.0.50:5555", "192.168.0.50", "tv1"]
+"192.168.0.60:5555" = ["192.168.0.60", "dongle1"]
 ```
 
-Each line is one lock. Use the USB serial first where the device has one. A network-only device
+Each entry is one lock. Use the USB serial as the key where the device has one. A network-only device
 uses its address. Nicknames work in every devlock command and in the hook, but adb does not know
 them, so use them with `devlock run` (which turns them into a real adb name) rather than with
 `adb -s`.
 
-Some scripts pick a default device when none is given. List them as `script` lines and devlock
-refuses to run them unless the command names a device:
+Some scripts pick a default device when none is given. List them under `scripts` (before
+`[devices]`) and devlock refuses to run them unless the command names a device:
 
+```toml
+scripts = ['ota-tool/run\.py\s+(push|install|reboot-verify)']
 ```
-script install-local-ota/scripts/run\.py\s+(push|install|reboot-verify)
-```
+
+`devlock doctor --fix` writes the entries for you from the devices connected now. The older
+`devices.conf` format (one line per device, `script <regex>` lines) is still read.
 
 See [reference.md](reference.md#devicesconf) for the full format.
 
@@ -190,9 +195,9 @@ deny: Device busy - R58M12345AB: another session's run holds it (...)
 
 `devlock log --denied --since 1h` lists recent refusals with their reasons.
 
-### Keeping devices.conf complete
+### Keeping the device list complete
 
-A name missing from `devices.conf` is a separate lock, so two sessions can reach one device under
+A name missing from `devices.toml` is a separate lock, so two sessions can reach one device under
 two names. `devlock doctor` reads `ro.serialno` from every connected device, groups the names that
 belong to the same one and reports gaps; `devlock doctor --fix` writes them into the file. Run it
 after you plug in a new device or a device gets a new address.
@@ -228,10 +233,10 @@ device (`adb -s`, `ANDROID_SERIAL`, `fastboot -s`); run long or background devic
 |---|---|
 | Every device command is refused with "Name the device" | The command lets adb choose. Add `-s <serial>` or `ANDROID_SERIAL=<serial>`. |
 | "devlock needs the device spelled out, not a variable" | `adb -s $DEV` cannot be checked before it runs. Write the serial out, or wrap the work in `devlock run <dev> -- ...` and use `$ANDROID_SERIAL` inside it. |
-| The same TV is locked twice under two names | Its names are not on one line in `devices.conf`. Run `devlock doctor --fix` while it is connected under both. |
+| The same TV is locked twice under two names | Its names are not in one entry of `devices.toml`. Run `devlock doctor --fix` while it is connected under both. |
 | A device stays busy after a session crashed | A lease ends on its own within 5 minutes (or the Bash timeout plus one minute). A run ends when its processes are gone. A hold ends at its TTL. `devlock status` shows the holder. Do not delete state files while a session may still be using the device. |
 | A device stays busy for 2 minutes after the other session finished | That is the sticky window, kept for the other session's next prompt. Queue with `devlock run`: a waiting run ends the window at once. |
 | "devlock state is locked by a stuck process" | Another devlock process held the state lock for over 5 seconds. Retry. If it repeats, look for a hung `devlock` process. |
 | Hooks seem to do nothing | Restart the session. Check that `~/.claude/settings.json` has `devlock hook pre` under `PreToolUse`, and read `~/.local/state/devlock/hook.log`. |
 | A command was wrongly refused or wrongly allowed | `devlock check '<command>'` shows the decision and `devlock log` the recent ones. Please open an issue with the command. |
-| Something else looks off | `devlock doctor` checks the state dir, `devices.conf`, the hooks and the connected devices. |
+| Something else looks off | `devlock doctor` checks the state dir, the device list, the hooks and the connected devices. |

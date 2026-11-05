@@ -24,5 +24,19 @@ jobs:
         run: |
           command -v jq || { if [ "$RUNNER_OS" = macOS ]; then brew install jq; else sudo apt-get install -y jq; fi; }
           bash --version | head -1
+      - name: tomli on Python < 3.11 (what the package installs there)
+        if: matrix.python == '3.9'
+        run: python -m pip install tomli
       - name: smoke tests
         run: bash tests/smoke.sh
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: installed command works
+        run: |
+          uv tool install dist/*.whl
+          devlock --version
+          echo '{"session_id":"s","tool_name":"Bash","tool_input":{"command":"adb shell ls"}}' | devlock hook pre | grep -q deny
