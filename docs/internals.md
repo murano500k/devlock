@@ -27,6 +27,10 @@ Claude Code ── PreToolUse ──> devlock hook pre ──> parse command ─
 agent Bash ─── devlock run ──> queue ──> register run ──> command in its own process group
 ```
 
+Codex sends the same events under the same names (`devlock hook <mode> --agent codex`); Cursor's
+`beforeShellExecution`, `afterShellExecution`, `stop` and `sessionEnd` all go to `devlock hook
+cursor`, which maps them to pre, post, stop and end.
+
 All of them read and write the same state directory under one `flock`.
 
 ## The command parser
@@ -132,10 +136,10 @@ registers the run as soon as there are none.
 
 ## Known limits
 
-- **Linux only.** Process start times come from `/proc`. On macOS a run would be seen as alive only
-  through its process group.
-- **Claude Code only.** The hook speaks Claude Code's hook protocol, and session identity comes
-  from `CLAUDE_CODE_SESSION_ID`.
+- **Linux and macOS.** Process start times come from `/proc` on Linux and `ps -o lstart=` elsewhere
+  (one `ps` call per run or waiter checked).
+- **Three agents.** Claude Code and Codex share a hook protocol; Cursor has its own, mapped in
+  `hook_input()` and `respond()`. Cursor does not pass a session id to the commands it runs.
 - **One machine.** State is local files.
 - **Advisory.** Commands outside Claude Code, and scripts that call adb without naming the device
   in the command text, are not seen.

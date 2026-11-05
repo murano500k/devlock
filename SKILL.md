@@ -35,12 +35,14 @@ the same device. Rules for every session:
 - **Never work around a refusal** (other spellings, deleting state files, `adb -d`). Queue with
   `devlock run`, use another device, or ask the user.
 
-`devlock` is `~/.claude/skills/devlock/devlock` (also linked into `~/.local/bin`).
+`devlock` is `~/.claude/skills/devlock/devlock` (also linked into `~/.local/bin`). The same rules
+apply in Codex and Cursor sessions when their hooks are installed.
 
 ## Setup
 
 1. `./install.sh --conf <your devices.conf>`: links this repo as the skill, puts `devlock` on PATH,
-   links the device list into `~/.local/state/devlock/` and registers the hooks.
+   links the device list into `~/.local/state/devlock/` and registers the hooks for Claude Code,
+   Codex and Cursor (whichever are set up; `--claude/--codex/--cursor` to choose).
 2. New device or address: `devlock doctor` finds connected names of one device (same
    `ro.serialno`) that are missing from devices.conf, `devlock doctor --fix` adds them. By hand: add it to that devices.conf - one line per device, serial first, then
    every other name (IP:port, bare IP, nickname). Each line is one lock. `script <regex>` lines name

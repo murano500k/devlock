@@ -125,24 +125,52 @@ Checks the setup, then the devices connected now.
 Drops the calling session's leases and holds: on one device, or on all of them without `DEVICE`.
 Runs are not affected; they end when their command does.
 
-### `devlock hook pre|post|stop|end`
+### `devlock install [--claude] [--codex] [--cursor] [--conf PATH] [--exe CMD]`
 
-Entry points for Claude Code. They read the hook's JSON from stdin. Not meant to be run by hand.
+Registers devlock's hooks, replacing devlock entries from an earlier install and keeping every
+other hook. Without an agent flag: every agent whose config dir exists (`~/.claude`, `~/.codex`,
+`~/.cursor`), or Claude Code if none does. Each file it changes is backed up as
+`<file>.bak-devlock-<time>`.
+
+| Agent | File | Events |
+|---|---|---|
+| Claude Code | `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`) | `PreToolUse` (Bash, Monitor), `PostToolUse`, `PostToolUseFailure` (Bash), `Stop`, `SessionEnd` |
+| Codex | `$CODEX_HOME/hooks.json` (default `~/.codex`) | `PreToolUse`, `PostToolUse` (Bash), `Stop`, `SessionEnd` |
+| Cursor | `~/.cursor/hooks.json` | `beforeShellExecution`, `afterShellExecution`, `stop`, `sessionEnd` |
+
+- Codex: also adds the state dir to `writable_roots` under `[sandbox_workspace_write]` in
+  `config.toml`, so commands in Codex's sandbox can run `devlock run`, `hold` and `release`. If the
+  table already exists it only prints the line to add.
+- `--conf PATH` links `PATH` as the state dir's `devices.conf`.
+- `--exe CMD`: how the hooks call devlock. Default: this file's absolute path, or
+  `$HOME/.claude/skills/devlock/devlock` when that link points to it.
+
+### `devlock hook pre|post|stop|end [--agent claude|codex]`, `devlock hook cursor`
+
+Entry points for the agents. They read the hook's JSON from stdin and answer in that agent's
+format. `--agent codex` changes only the wording of advice; the protocol is Claude Code's. `hook
+cursor` takes the event from `hook_event_name` and always answers a shell command with
+`{"permission": "allow"}` or `"deny"` (Cursor blocks on a missing answer). Not meant to be run by
+hand.
 
 ## Session identity
 
-A session is identified by `CLAUDE_CODE_SESSION_ID`. Outside Claude Code (a plain terminal) it is
-`shell-<parent pid>`, so commands from one shell count as one session.
+The hooks get the session id from the hook input: `session_id` for Claude Code and Codex,
+`conversation_id` for Cursor.
 
-The hooks get the session id from the hook input. The other commands read it from the environment, which Claude Code sets for the commands it runs.
+The other commands read it from the environment, first match wins: `CLAUDE_CODE_SESSION_ID` (set
+by Claude Code for the commands it runs), `CODEX_SESSION_ID` (set by Codex). Without any of them (a plain terminal, or Cursor) it is `shell-<parent pid>`, so commands
+from one shell count as one session. A hold taken in an agent session ends with that session; one
+taken from a terminal ends only at its TTL or on `release`.
 
 ## Holders
 
 A device is busy for session S when another session has either of these:
 
 - **Lease** - taken by the `pre` hook on the first command that uses the device.
-  - Lasts `DEVLOCK_LEASE_SEC` (default 300) or the Bash call's timeout plus 60 s, whichever is
-    longer (Bash default timeout 120 s).
+  - Lasts `DEVLOCK_LEASE_SEC` (default 300) or the call's timeout plus 60 s, whichever is longer
+    (Claude Code's `timeout`, default 120 s; Codex's `timeout_ms`; 600 s for Cursor, which sends
+    none).
   - `post` extends it to at least `now + DEVLOCK_LEASE_SEC` after each command.
   - `stop` (end of turn) shortens it to at most `DEVLOCK_STICKY_SEC` (120 s) from now and marks
     it idle. It drops it at once when another session has a `run` or `wait` waiting for the device

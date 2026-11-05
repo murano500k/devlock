@@ -1,7 +1,7 @@
 # devlock
 
-Keeps parallel [Claude Code](https://claude.com/claude-code) sessions on one machine off the same
-adb / fastboot / scrcpy test device.
+Keeps parallel coding-agent sessions ([Claude Code](https://claude.com/claude-code), Codex, Cursor)
+on one machine off the same adb / fastboot / scrcpy test device. Linux and macOS.
 
 When several sessions test on the same TVs, phones or dongles, one reboots a device in the middle of
 another's test. devlock is a set of Claude Code hooks plus a small queueing CLI:
@@ -32,8 +32,11 @@ git clone https://github.com/murano500k/devlock ~/projects/devlock
 ```
 
 `install.sh` links the repo as the `devlock` skill (`~/.claude/skills/devlock`), puts `devlock` on
-`~/.local/bin`, links your device list into `~/.local/state/devlock/` and registers the hooks in
-`~/.claude/settings.json` (with a backup). Restart Claude Code afterwards.
+`~/.local/bin`, links your device list into `~/.local/state/devlock/` and runs `devlock install`,
+which registers the hooks (with a backup) for every agent set up on the machine: Claude Code
+(`~/.claude/settings.json`), Codex (`~/.codex/hooks.json`) and Cursor (`~/.cursor/hooks.json`). Pick
+agents with `--claude`, `--codex`, `--cursor`. Restart running sessions afterwards; in Codex,
+approve the new hooks once with `/hooks`.
 
 ## devices.conf
 

@@ -36,7 +36,7 @@ person, Android Studio, or a script that calls adb without naming the device in 
 
 ## Install
 
-Requirements: Linux, Python 3.8 or newer, bash, jq, and Claude Code.
+Requirements: Linux or macOS, Python 3.9 or newer, bash, and Claude Code, Codex or Cursor.
 
 ```bash
 git clone https://github.com/murano500k/devlock ~/projects/devlock
@@ -48,9 +48,31 @@ git clone https://github.com/murano500k/devlock ~/projects/devlock
 - links the repo as the `devlock` skill at `~/.claude/skills/devlock`, so agents can read `SKILL.md`;
 - links `devlock` into `~/.local/bin`;
 - links your device list to `~/.local/state/devlock/devices.conf`;
-- registers the hooks in `~/.claude/settings.json`, after saving a backup next to it.
+- runs `devlock install`, which registers the hooks for every agent set up on the machine, after
+  saving a backup of each file it changes:
+  - Claude Code: `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` if set);
+  - Codex: `~/.codex/hooks.json` (`$CODEX_HOME` if set), and the state dir is added to
+    `writable_roots` in `config.toml` so `devlock run` works inside Codex's sandbox;
+  - Cursor: `~/.cursor/hooks.json`.
 
-Restart running Claude Code sessions afterwards. Hooks are read when a session starts.
+  `--claude`, `--codex`, `--cursor` limit it to those agents.
+
+Restart running sessions afterwards; hooks are read when a session starts. Codex runs a new hook
+only after you approve it once with `/hooks`.
+
+### Codex and Cursor
+
+The rules are the same for every agent: name the device, run long work through `devlock run`,
+never work around a refusal. Differences:
+
+- **Codex** has no background tool, so the only background form refused is a trailing `&`.
+  Commands Codex runs see `CODEX_SESSION_ID`, so `devlock run`, `hold`, `release` and `whoami`
+  inside Codex belong to the same session as its hooks.
+- **Cursor** does not tell the commands it runs which conversation they belong to, so a `devlock
+  run` or `hold` from Cursor is a session of its own (`shell-<pid>`). When the conversation starts
+  `devlock run` on a device, its own lease on that device is dropped so the run does not wait for
+  it; while the run holds the device, the conversation's direct commands on it are refused. Cursor
+  does not tell the hook a command's timeout either: a lease lasts at least 11 minutes per command.
 
 ## Describe your devices
 

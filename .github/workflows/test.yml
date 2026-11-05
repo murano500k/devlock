@@ -1,0 +1,28 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: tools
+        run: |
+          command -v jq || { if [ "$RUNNER_OS" = macOS ]; then brew install jq; else sudo apt-get install -y jq; fi; }
+          bash --version | head -1
+      - name: smoke tests
+        run: bash tests/smoke.sh

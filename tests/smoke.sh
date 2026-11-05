@@ -4,7 +4,7 @@ set -u
 DL=$(cd "$(dirname "$0")/.." && pwd)/devlock
 export DEVLOCK_DIR=$(mktemp -d)
 trap 'rm -rf "$DEVLOCK_DIR"' EXIT
-unset DEVLOCK_CONF
+unset DEVLOCK_CONF CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID
 # stop frees at once unless a test sets the sticky window itself
 export DEVLOCK_STICKY_SEC=0
 cat > "$DEVLOCK_DIR/devices.conf" <<'EOF'
@@ -21,14 +21,16 @@ bad() { fail=$((fail + 1)); echo "FAIL $1${2:+ -- $2}"; }
 
 # hook <mode> <session> <command> [extra tool_input json] [tool]
 hook() {
-	jq -nc --arg s "$2" --arg c "$3" --argjson x "${4:-{\}}" --arg t "${5:-Bash}" \
+	local extra=${4:-}
+	[ -n "$extra" ] || extra='{}'
+	jq -nc --arg s "$2" --arg c "$3" --argjson x "$extra" --arg t "${5:-Bash}" \
 		'{session_id: $s, tool_name: $t, tool_input: ({command: $c} + $x)}' | "$DL" hook "$1"
 }
 allow() { local o; o=$(hook pre "$@"); [[ "$o" != *deny* ]] && ok "allow: ${2%%$'\n'*} [$1]" || bad "allow: ${2%%$'\n'*} [$1]" "$o"; }
 deny()  { local o; o=$(hook pre "$@"); [[ "$o" == *deny* ]] && ok "deny:  ${2%%$'\n'*} [$1]" || bad "deny:  ${2%%$'\n'*} [$1]" "no deny"; }
 stop()  { jq -nc --arg s "$1" '{session_id: $s}' | "$DL" hook stop; }
 end()   { jq -nc --arg s "$1" '{session_id: $s}' | "$DL" hook end; }
-reset() { end A; end B; end C; }
+reset() { for s in A B C CX1 CX2 CX3 CX9 CU1; do end $s; done; }
 
 # --- naming
 deny  A 'adb shell getprop'
@@ -455,7 +457,8 @@ o=$(CLAUDE_CODE_SESSION_ID=B "$DL" whoami)
 o=$(CLAUDE_CODE_SESSION_ID=B "$DL" status --json)
 [ "$(jq -r '.entries[0] | "\(.device) \(.kind) \(.session) \(.inflight)"' <<<"$o")" = "SER1 lease A null" ] \
 	&& ok "status --json" || bad "status --json" "$o"
-o=$(timeout 3 "$DL" status --watch --interval 1)
+"$DL" status --watch --interval 1 > "$DEVLOCK_DIR/watch.out" & wpid=$!
+sleep 2.5; kill $wpid 2>/dev/null; wait $wpid 2>/dev/null; o=$(cat "$DEVLOCK_DIR/watch.out")
 [[ "$o" == *"devlock status"*"SER1  lease"* ]] && ok "status --watch redraws" || bad "status --watch" "$o"
 deny B 'adb -s SER1 reboot'
 o=$("$DL" log --denied -n 1)
@@ -468,6 +471,41 @@ o=$(CLAUDE_CODE_SESSION_ID=C "$DL" check 'adb -s SER1 reboot' --json); [ $? = 1 
 o=$("$DL" check 'adb -s SER1 reboot' --session A); [ $? = 0 ] && ok "check: --session after the command" || bad "check trailing --session" "$o"
 reset
 
+# --- Codex and Cursor hooks
+cx() { jq -nc --arg s "$2" --arg c "$3" --arg e "${4:-PreToolUse}" \
+	'{session_id: $s, turn_id: "t1", hook_event_name: $e, tool_name: "Bash", tool_use_id: "call_1", tool_input: {command: $c}}' \
+	| "$DL" hook "$1" --agent codex; }
+cu() { jq -nc --arg s "$1" --arg c "$2" --arg e "${3:-beforeShellExecution}" \
+	'{conversation_id: $s, generation_id: "g1", hook_event_name: $e, command: $c, cwd: "/tmp", sandbox: false}' \
+	| "$DL" hook cursor; }
+o=$(cx pre CX1 'adb -s SER1 shell true'); [ -z "$o" ] && ok "codex: allowed command prints nothing" || bad "codex allow" "$o"
+o=$(cx pre CX2 'adb -s tva reboot'); [ "$(jq -r .hookSpecificOutput.permissionDecision <<<"$o")" = deny ] && ok "codex: busy device denied" || bad "codex deny" "$o"
+o=$(cx pre CX1 'adb -s SER2 logcat &'); [[ "$o" == *"not with a trailing &"* && "$o" != *run_in_background* ]] && ok "codex: background advice fits codex" || bad "codex bg wording" "$o"
+o=$(cu CU1 'adb -s SER1 shell true'); [ "$(jq -r .permission <<<"$o")" = deny ] && [[ "$(jq -r .agent_message <<<"$o")" == "Device busy"* ]] && ok "cursor: busy device denied" || bad "cursor deny" "$o"
+cx post CX1 'adb -s SER1 shell true' PostToolUse >/dev/null
+cx stop CX1 '' Stop >/dev/null
+o=$(cu CU1 'adb -s SER1 shell true'); [ "$(jq -r .permission <<<"$o")" = allow ] && ok "cursor: allowed after codex's turn ended" || bad "cursor allow" "$o"
+o=$(cu CU1 'ls -la'); [ "$(jq -r .permission <<<"$o")" = allow ] && ok "cursor: non-device command allowed" || bad "cursor ls" "$o"
+o=$(echo 'garbage' | "$DL" hook cursor); [ "$(jq -r .permission <<<"$o")" = allow ] && ok "cursor: bad input fails open with an allow" || bad "cursor bad input" "$o"
+cu CU1 'adb -s SER1 shell true' afterShellExecution >/dev/null
+deny B 'adb -s SER1 shell true'
+cu CU1 '' stop >/dev/null
+allow B 'adb -s SER1 shell true'
+reset
+CODEX_SESSION_ID=CX9 "$DL" hold SER2 >/dev/null
+o=$(CODEX_SESSION_ID=CX9 "$DL" whoami); [[ "$o" == *"CX9 (Codex session)"*"SER2  hold"* ]] && ok "whoami: Codex session from CODEX_SESSION_ID" || bad "codex whoami" "$o"
+deny B 'adb -s SER2 shell true'
+cx end CX9 '' SessionEnd >/dev/null
+allow B 'adb -s SER2 shell true'
+o=$(jq -nc '{session_id: "CX3", hook_event_name: "PreToolUse", tool_name: "Bash", tool_use_id: "c9", tool_input: {command: "adb -s SER1 shell true", timeout_ms: 1800000}}' | "$DL" hook pre --agent codex)
+[ "$(jq '.until - now > 1700' "$DEVLOCK_DIR/SER1.lease")" = true ] && ok "codex: timeout_ms sets the lease" || bad "codex timeout_ms" "$(cat "$DEVLOCK_DIR/SER1.lease")"
+end CX3
+cu CU1 'adb -s SER1 shell true' >/dev/null
+o=$(cu CU1 'devlock run SER1 -- ./long-test.sh'); [ "$(jq -r .permission <<<"$o")" = allow ] && [ ! -s "$DEVLOCK_DIR/SER1.lease" ] \
+	&& ok "cursor: own lease dropped for its devlock run" || bad "cursor run handoff" "$o $(cat "$DEVLOCK_DIR/SER1.lease")"
+o=$(jq -nc '{conversation_id: "CU1", hook_event_name: "stop", status: "completed"}' | "$DL" hook cursor); [ -z "$o" ] && ok "cursor: no permission answer to stop" || bad "cursor stop output" "$o"
+reset
+
 # --- doctor (fake adb: each name and the ro.serialno behind it)
 FAKE=$DEVLOCK_DIR/fakeadb
 mkdir -p "$FAKE/conf"
@@ -478,7 +516,7 @@ if [ "$1" = devices ]; then echo "List of devices attached"; awk '{print $1"\t"(
 [ "$1" = -s ] && awk -v n="$2" '$1 == n {print $2}' "$map"
 ADB
 chmod +x "$FAKE/adb"
-doctor() { DEVLOCK_ADB="$FAKE/adb" DEVLOCK_CONF="$FAKE/devices.conf" CLAUDE_CONFIG_DIR="$FAKE" "$DL" doctor "$@"; }
+doctor() { HOME="$FAKE" DEVLOCK_ADB="$FAKE/adb" DEVLOCK_CONF="$FAKE/devices.conf" CLAUDE_CONFIG_DIR="$FAKE" "$DL" doctor "$@"; }
 conf0='SER1 10.0.0.2:5555 10.0.0.2 tva  # living room
 SER2 10.0.0.20:5555 tvb
 SERX x1
