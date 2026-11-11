@@ -296,6 +296,9 @@ R58M12345AB = ["192.168.0.50:5555", "192.168.0.50", "pixel"]
   Names are matched exactly (case-sensitive).
 - **Script line:** `script <python regex>`. A command that matches the regex and names no device is
   refused.
+- **No-device line:** `nodevice <python regex>`. A script or interpreter command that matches it is
+  not a device command, even when a device name is in its arguments (e.g. a build planner that
+  takes `--device 1fb` as a product code). In devices.toml: `nodevice = ['...']` before `[devices]`.
 - A name that is on no line is its own device.
 - A broken line or an invalid regex is skipped and logged. A missing file means no aliases.
 

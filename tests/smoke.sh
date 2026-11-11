@@ -13,6 +13,7 @@ SER1 10.0.0.2:5555 10.0.0.2 tva
 SER2 10.0.0.20:5555 tvb
 DONGLE 10.0.0.35:5555
 script fake-ota/run\.py\s+(push|install)
+nodevice fake-plan/resolve\.py
 EOF
 
 pass=0 fail=0
@@ -60,6 +61,8 @@ deny  B 'echo "$(adb -s SER1 shell getprop ro.serialno)"'
 deny  B "bash -c 'adb -s SER1 reboot'"
 deny  B 'timeout 30 adb -s SER1 wait-for-device'
 deny  B 'python3 fake-ota/run.py push x.zip --device=10.0.0.2:5555'
+deny  B 'python3 other/plan.py --device tva'
+allow B 'python3 fake-plan/resolve.py 123 --device tva'
 allow A 'adb -s tva shell true'
 stop A
 allow B 'adb -s SER1 shell getprop'

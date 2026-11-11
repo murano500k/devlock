@@ -114,7 +114,7 @@ GRADLE_DEVICE_TASK = re.compile(r"^((connected|install|uninstall)[A-Z]\w*(?<!Dis
 SCRCPY_FREE = {"-v", "--version", "-h", "--help"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
-ALIASES, SCRIPTS = {}, []
+ALIASES, SCRIPTS, NODEVICE = {}, [], []
 
 
 SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), ("CODEX_SESSION_ID", "codex"))
@@ -147,11 +147,12 @@ def load_conf():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("script "):
+        if line.startswith(("script ", "nodevice ")):
+            kind, pat = line.split(None, 1)
             try:
-                SCRIPTS.append(re.compile(line.split(None, 1)[1].strip()))
+                (SCRIPTS if kind == "script" else NODEVICE).append(re.compile(pat.strip()))
             except re.error as e:
-                log(f"WARN devices.conf: bad script pattern {line!r}: {e}")
+                log(f"WARN devices.conf: bad {kind} pattern {line!r}: {e}")
             continue
         names = line.split("#", 1)[0].split()
         for n in names:
@@ -199,6 +200,11 @@ def load_toml_conf():
             SCRIPTS.append(re.compile(str(pat)))
         except re.error as e:
             log(f"WARN devices.toml: bad script pattern {pat!r}: {e}")
+    for pat in as_list(data.get("nodevice") or []) or []:
+        try:
+            NODEVICE.append(re.compile(str(pat)))
+        except re.error as e:
+            log(f"WARN devices.toml: bad nodevice pattern {pat!r}: {e}")
     for serial, names in devices.items():
         names = as_list(names)
         if names is None:
@@ -762,6 +768,8 @@ def visit(toks, k, chunk, use, env_serials, depth):
                     visit(sub, kk, " ".join(sub), use, env_serials, depth)
     elif (prog.endswith((".sh", ".py")) or "/" in toks[k] or prog in INTERPRETERS
           or (prog in SHELLS and rest) or prog in ("gradlew", "make", "pytest")):
+        if any(p.search(chunk) for p in NODEVICE):
+            return
         named = mentioned(chunk) | {canon(s) for s in env_serials}
         use.devices |= named
         if not named and any(p.search(chunk) for p in SCRIPTS):
